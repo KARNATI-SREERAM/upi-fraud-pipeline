@@ -1,233 +1,315 @@
-# LEARNING.md: Project 1 study notes
+# LEARNING.md: Project 1 study guide
 
-<!-- Built up phase by phase. Final sections (full walkthrough, file table, 25 interview Qs) come in Phase 5. -->
+<!-- How the whole project works, file by file, with exercises and interview prep. Every number
+     in this file comes from ONE run of ./scripts/measure_all.sh, saved in results/measured_run.txt. -->
 
----
+Real-time UPI-style transaction pipeline with fraud detection: a simulator → Kafka → a processor that
+validates, deduplicates and scores each transaction → PostgreSQL → a FastAPI service.
 
-## Phase 1: Producer + Kafka
-
-### What was built
-| File | Purpose | Key concept |
-|---|---|---|
-| `docker-compose.yml` | Starts Kafka, creates topics, starts the producer | Service dependencies, healthchecks, KRaft, listeners |
-| `producer/generator.py` | Builds users/merchants and makes normal, fraud and dirty txns | Pure functions → easy to test; seeded randomness |
-| `producer/main.py` | Sends generated txns to `transactions.raw` at a fixed rate | Message keys, delivery callbacks, `acks`, `flush()` |
-| `producer/Dockerfile` | Container image for the producer | Layer caching, exec-form CMD (PID 1 gets SIGTERM) |
-| `tests/test_generator.py` | 12 tests on the generator's output | Testing data shape without any infrastructure |
-| `pyproject.toml` | ruff + pytest config | Linting, test discovery |
-
-### Walk of one transaction
-1. `main.py` calls `generator.next_batch()`. It rolls a random number: 2% fraud event, 5% dirty event, otherwise normal.
-2. A normal txn picks a random user, a payee (70% merchant / 30% P2P), and an amount near that user's `typical_amount`.
-3. `main.py` turns it into JSON and calls `producer.produce("transactions.raw", key=payer_vpa, value=...)`.
-   This only puts it in a **local buffer**; it has not been sent yet.
-4. The client batches buffered messages (`linger.ms=5`) and sends them to the broker.
-5. Kafka hashes the key to choose a partition: `partition = hash(key) % 3`. The same payer always lands on the same partition.
-6. The broker appends the message to the end of that partition's log and gives it the next **offset** (0, 1, 2, ...).
-7. Because `acks=all`, the broker replies only once the write is stored. The client then runs `on_delivery()`, which increments `delivered`.
-
-### Key concepts (tied to the code)
-- **Topic.** A named stream of messages, like a table name for events. We have 3: `raw` (everything the producer sends), and `clean` / `flagged` for later phases. Created in `kafka-init`.
-- **Partition.** A topic is split into partitions, and each one is an append-only log. Partitions are how Kafka scales: different consumers can read different partitions in parallel. You can see this in `kafka-topics.sh --describe` (PartitionCount: 3).
-- **Offset.** A message's position inside one partition. Ordering is guaranteed **only within a partition**, not across the whole topic. `kafka-get-offsets.sh` showed `0:179 1:227 2:210`.
-- **Message key → partition.** `main.py` uses `key=payer_vpa`, so all of one user's payments stay in order on one partition. Phase 2 needs this to compute "txns by this user in the last 5 min" correctly. Records with a missing payer get `key=None`, and Kafka spreads those across partitions.
-- **Broker / KRaft.** The broker is the Kafka server that stores partitions. Older Kafka needed a separate ZooKeeper cluster for metadata. In KRaft mode Kafka manages metadata itself (`KAFKA_PROCESS_ROLES: broker,controller`), which means one fewer service and less RAM.
-- **Listeners.** Clients first connect to a bootstrap address. The broker then tells them where to reconnect (the *advertised* listener). Containers must be told `kafka:9092` and your Mac must be told `localhost:9094`, so we define two listeners. Getting this wrong is the #1 "Kafka works in Docker but not from my laptop" bug.
-- **acks=all + idempotence.** With `acks=all`, the broker confirms only after the write is durable. With `enable.idempotence=True`, a producer retry after a network blip can't write the same message twice. Note that this does **not** stop *our* deliberately duplicated records. Those have the same `txn_id` but are two separate `produce()` calls, so the processor must dedupe them in Phase 2.
-- **flush() on shutdown.** `produce()` is asynchronous. If the process exits with messages still buffered, they are lost. `handle_stop()` catches SIGTERM so the loop can exit and `flush()` can drain the buffer. Measured: `sent=3715 delivered=3715 undelivered=0` after `docker compose stop producer`.
-- **Labels vs features.** `is_fraud` / `fraud_pattern` are ground truth, used only to train and evaluate the model. If the scorer read them, it would look 100% accurate and be useless in production (**label leakage**).
-
-### Observation to remember for Phase 3
-Fraud *events* are 2%, but fraud bursts contain many txns (`many_payees` sends 8–15). In a sample of
-1500 real messages, 220 were labelled fraud (≈14.7%). Real UPI fraud rates are far lower (well under 1%).
-We'll decide in Phase 3 whether to lower `FRAUD_RATE` to get a realistic class imbalance.
-
-### Break it to learn it
-1. **Remove the message key.** In `main.py` change `key=key` to `key=None`, rebuild, and consume with `--property print.partition=true`.
-   *What goes wrong:* the same user's txns now appear on different partitions.
-   *Why:* without a key, the client spreads messages across partitions for balance. A consumer reading partition 0 no longer sees the user's full history, so per-user features (Phase 2) would be wrong or, with several consumers, split across machines.
-2. **Break the advertised listener.** Change `EXTERNAL://localhost:9094` to `EXTERNAL://kafka:9094` and run the Mac consumer snippet against `localhost:9094`.
-   *What goes wrong:* the first connection succeeds, then the client hangs or errors with "Failed to resolve kafka:9094".
-   *Why:* bootstrap only returns metadata. The client then reconnects to the *advertised* address, and your Mac can't resolve the Docker-internal hostname `kafka`.
-3. **Kill the broker mid-stream.** Run `docker compose stop kafka` for 20 s, then `docker compose start kafka`, while watching `docker compose logs -f producer`.
-   *What goes wrong:* `delivered` stops increasing while `sent` keeps growing, and the gap is the messages sitting in the local buffer.
-   *Why:* `produce()` only buffers locally, and librdkafka keeps retrying. If the outage is longer than `message.timeout.ms` (default 5 min), those messages fail, and `failed` goes up. When the broker returns, the buffer drains and `delivered` catches up. Try `docker compose kill producer` (SIGKILL, no flush) during an outage and compare `sent` with the offsets: the buffered messages are lost.
-
----
-
-## Phase 2: Processor (validate, clean, dedup, quarantine → PostgreSQL)
-
-### What was built
-| File | Purpose | Key concept |
-|---|---|---|
-| `db/schema.sql` | `transactions` and `quarantine` tables | Primary key as durable dedup; `UNIQUE(partition, offset)`; NUMERIC for money; CHECK constraint |
-| `processor/validate.py` | Turns one raw message into a clean txn, or a rejection reason | Validate vs clean vs reject; pure functions |
-| `processor/store.py` | Idempotent inserts; tells "redelivery" apart from "duplicate" | `INSERT ... ON CONFLICT DO NOTHING`, `rowcount` |
-| `processor/main.py` | Consumer loop: batch → DB commit → forward to clean → commit offsets | Consumer groups, manual offset commits, at-least-once |
-| `tests/test_validate.py` | One test per rule + every generator dirty type is caught | Testing the contract between two services |
-| `tests/test_store.py` | Runs against real Postgres, rolls back after each test | Integration tests, skip when infrastructure is missing |
-
-### Walk of one message through the processor
-1. `consumer.consume(100, timeout=1.0)` returns up to 100 messages from the partitions assigned to this consumer.
-2. For each message, `validate.validate(msg.value())` parses the JSON, checks the 8 required fields, cleans the VPAs (strip + lowercase), then checks VPA format, self-payment, amount and timestamp. The first failure becomes the reason, e.g. `malformed_vpa:payer`.
-3. If it's **rejected**, `store.save_quarantine()` writes the raw message + reason + (partition, offset).
-4. If it's **valid**, `store.save_txn()` runs `INSERT ... ON CONFLICT (txn_id) DO NOTHING`.
-   - If 1 row was written → `inserted`.
-   - If 0 rows were written, the txn_id exists already. If the stored (partition, offset) matches this message, it's a `redelivery` (Kafka sent the same message again), so skip it. Otherwise it's a `duplicate` (a different message with the same id), so quarantine it as `duplicate_txn_id`.
-5. After the whole batch, `conn.commit()` makes all of its rows durable at once.
-6. Inserted txns are produced to `transactions.clean`, and `producer.flush()` waits until Kafka has them.
-7. `consumer.commit()` tells Kafka "group `processor` has finished up to here". Only now will a restart skip these messages.
-
-### Key concepts (tied to the code)
-- **Consumer group.** `group.id: "processor"` in `main.py`. All consumers with the same group id share a topic's partitions, and each partition goes to exactly one member. With 3 partitions, up to 3 processors can work in parallel, and a 4th would sit idle. A *different* group id gets its own full copy of the stream (that's how the API or an analytics job could read the same data independently).
-- **Offsets and commits.** Kafka doesn't delete a message when you read it. Instead, each group stores a *committed offset* per partition, meaning "read up to here". `enable.auto.commit=False` means *we* decide when to commit: only after the data is safe in Postgres. You can see this with `kafka-consumer-groups.sh --describe --group processor` (CURRENT-OFFSET, LOG-END-OFFSET, LAG).
-- **At-least-once.** Commit order: DB first, offsets last. If we crash in between, Kafka re-sends those messages, so you may see a message **more than once but never zero times**. The alternative, **at-most-once** (commit offsets first), loses data on a crash. For payments, losing a transaction is worse than seeing it twice, provided the second time is harmless.
-- **Idempotent writes (why dedup is needed).** At-least-once only works if processing a message twice has the same effect as once. The `txn_id` PRIMARY KEY + `ON CONFLICT DO NOTHING` does that for good records, and `UNIQUE(kafka_partition, kafka_offset)` does it for quarantined ones. Measured (see *Measured results* below): a full replay of 3159 messages gave `redeliveries=3159` and **0** new rows.
-- **Redelivery vs duplicate.** These are two different problems that look alike. A *redelivery* is the same Kafka message again, with the same offset. A *duplicate* is two separate messages with the same txn_id (e.g. the sender's app retried). Storing (partition, offset) on each row is how the code tells them apart.
-- **Exactly-once?** Kafka has transactions for Kafka-to-Kafka exactly-once, but here we write to Postgres, which is outside Kafka. The practical pattern is *at-least-once delivery + idempotent processing = effectively-once results*. The DB table is effectively-once. `transactions.clean` is at-least-once: after the replay it held 5992 messages for 2996 rows, so its readers must dedupe by txn_id too. A crash can cause the same effect on a smaller scale. If the kill lands after the DB commit but before the offset commit, the restarted processor re-forwards that batch. In the measured run the kill didn't land there (`redeliveries=0` after the restart).
-- **Validate vs clean vs quarantine.** *Clean* what is safe to fix without guessing: VPA case and whitespace. *Reject* what you can't fix: a missing amount can't be invented. *Quarantine* rather than drop, so that bad data is visible, countable (the `/stats` endpoint in Phase 4 will use it) and replayable after a bug fix. Note that fraud is **not** dirty data: `test_fraud_records_are_not_rejected` makes sure cleaning never throws away the suspicious-but-valid records the model needs.
-- **Defence in depth.** `CHECK (amount > 0)` in the schema stops bad money data even if `validate.py` has a bug (`test_db_rejects_non_positive_amount`). NUMERIC(12,2) stores money exactly: `0.1 + 0.2` is stored as `0.30`, not `0.30000000000000004`.
-- **Crash-only design.** `main.py` has no clever partial-recovery code. Any exception exits the process, Docker restarts it (`restart: unless-stopped`), and Kafka replays the uncommitted batch. The DB transaction rolls back, so a half-written batch never exists.
-- **Session timeout (seen in the crash test).** After `docker compose kill processor`, processing resumed only 46 s after the kill, even though the new processor started 5 s after it. The killed consumer never said goodbye, so the group waited for its `session.timeout.ms` (45 s default) to expire before giving its partitions to the new member. A graceful `docker compose stop` calls `consumer.close()`, which leaves the group at once, so there's no wait.
-
-### Bug found during Phase 2 (a good interview story)
-The Phase 1 producer seeded *everything* with `SEED=42`, including txn_ids. When the producer was restarted, it re-sent the same txn_ids from the start, and the processor correctly quarantined them all as duplicates. The fix is in `producer/main.py`: the seed now only fixes the **user population**, and the stream uses fresh randomness on every run. `scripts/verify_phase2.sh` restarts the producer mid-run and checks this: injected dirty events = quarantined records exactly (163 = 163 in the measured run). Any re-sent txn_id would show up as an extra `duplicate_txn_id`.
-
-### Measured results (one run, one command)
-Every Phase 2 number in this file and in README.md comes from this single run (MacBook, Apple Silicon,
-Docker Desktop with 7.7 GiB, 2026-10-15). To reproduce it from the project folder:
-
+**Every number below comes from a single run:**
 ```bash
-./scripts/verify_phase2.sh      # about 4 minutes; WARNING: deletes existing pipeline data first
+./scripts/measure_all.sh        # ~10-15 min; deletes existing pipeline data first; output -> results/measured_run.txt
+```
+Section 7 shows that run's results and how to read them.
+
+---
+
+## 1. Architecture and the life of one transaction
+
+```mermaid
+flowchart LR
+    T[trainer<br/>one-shot] -->|model.joblib| V[(models volume)]
+    P[producer] -->|key = payer_vpa| R[(transactions.raw<br/>3 partitions)]
+    R --> PR[processor<br/>validate · dedup · features · score]
+    V -.-> PR
+    PR -->|valid + scored| TX[(Postgres<br/>transactions)]
+    PR -->|rejected + reason| Q[(Postgres<br/>quarantine)]
+    PR --> C[(transactions.clean)]
+    PR -->|score ≥ 0.5| F[(transactions.flagged)]
+    TX --> API[FastAPI<br/>:8000]
+    Q --> API
+    V -.-> API
 ```
 
-What the script does, in order:
-1. `docker compose down -v`, then `up --build`: empty Kafka and Postgres, run for 60 s.
-2. `docker compose kill processor` (SIGKILL), `start` it 5 s later. Times how long until a new offset is committed.
-3. `docker compose restart producer`: checks that a restart doesn't re-send old txn_ids.
-4. `docker stats`: memory while everything runs.
-5. Stops the producer, waits for consumer lag 0, then checks the accounting (`PASS`/`FAIL` lines).
-6. Stops the processor, resets the group's offsets to the start (`--reset-offsets --to-earliest`), replays everything, and checks that no rows were added.
+**One transaction, step by step**
+1. **Training (once, at start-up).** The `trainer` container simulates 200,000 labelled transactions, computes features with `model/features.py`, trains three models, keeps the best by validation F1, and writes `model.joblib` to the shared `models` volume. The processor and API only start after it exits successfully (`service_completed_successfully`).
+2. **Produce.** `producer/main.py` calls `generator.next_batch()`. Usually that's one normal payment. About 2% of transactions belong to a fraud pattern, and some events are deliberately dirty. The record is sent as JSON to `transactions.raw` with **key = payer VPA**, so all of one user's payments land on the same partition, in order.
+3. **Kafka stores it.** The broker appends it to one partition's log at the next **offset**. The message stays there whether or not anyone reads it.
+4. **Consume.** `processor/pipeline.py` (consumer group `processor`) reads up to 100 messages with `consume()`.
+5. **Validate and clean.** `validate.validate()` parses the JSON, checks the 8 required fields, lowercases and trims the VPAs, then checks VPA format, self-payment, amount and timestamp. A failure is stored in `quarantine` with its reason and Kafka position.
+6. **Features.** `store.fetch_history()` loads this payer's newest 100 earlier transactions (index on `(payer_vpa, ts)`), and `features.compute_features()` turns them into 7 numbers. This is the *same function* the trainer used.
+7. **Score.** `scorer.score()` returns the model's fraud probability, and `flagged = score >= 0.5`.
+8. **Store, idempotently.** `store.save_txn()` runs `INSERT … ON CONFLICT (txn_id) DO NOTHING`. If the id already exists, it compares the stored (partition, offset): the same offset means a Kafka **redelivery** (skip), and a different offset means a **genuine duplicate** (quarantine `duplicate_txn_id`).
+9. **Commit in the safe order.** First the DB commit, then produce to `transactions.clean` (and `transactions.flagged` if flagged) and `flush()`, and only then `consumer.commit()`. A crash before the last step means Kafka re-sends the batch, and step 8 makes that harmless.
+10. **Serve.** `GET /transactions/flagged` lists it if it was flagged, `GET /stats` counts it, and `POST /score` can score a *new* transaction for the same payer, using this one as history.
 
-Output of the measured run, unedited:
-```
-== 1. Clean start (fresh Kafka + Postgres), run for 60 s
-== 2. SIGKILL the processor (no clean shutdown), restart it 5 s later
-seconds from SIGKILL until processing resumed: 46
-== 3. Restart the producer (a restart must not re-send old txn_ids)
-== 4. Memory, all containers running
-processor-1: 25.63MiB / 7.748GiB
-producer-1: 10.2MiB / 7.748GiB
-postgres-1: 29.06MiB / 7.748GiB
-kafka-1: 478.6MiB / 7.748GiB
-== 5. Stop the producer, wait for the processor to catch up (lag 0)
-producer runs: 2, last reported rate: rate=20.0 txn/s
-PASS  producer sent == messages in transactions.raw: 3159 = 3159
-PASS  raw messages == transactions + quarantine: 3159 = 3159
-PASS  dirty events injected == records quarantined: 163 = 163
-PASS  duplicate txn_ids in transactions table: 0 = 0
-transactions=2996 quarantine=163
-quarantine by reason: duplicate_txn_id=42 malformed_vpa=49 missing_field=42 non_positive_amount=30
-fraud-labelled transactions: 239 of 2996 (8.0%)
-== 6. Full replay: reset the group's offsets to the start and reprocess everything
-processor counters after the SIGKILL restart: consumed=1958 inserted=1860 quarantined=98 redeliveries=0
-processor counters for the replay: consumed=3159 inserted=0 quarantined=0 redeliveries=3159
-PASS  transactions after replay (unchanged): 2996 = 2996
-PASS  quarantine after replay (unchanged): 163 = 163
-transactions.clean messages: before replay=2996 after replay=5992
-== Done (stack stopped, data volume kept)
-```
+---
 
-How to read it:
-- **3159 = 2996 + 163**: every raw message ended up in exactly one table. Nothing was lost and nothing was stored twice, despite the SIGKILL.
-- **163 = 163**: every injected dirty record was caught, and no clean record was rejected. Of the 163, 42 are `duplicate_txn_id` (genuine duplicates, caught by the primary key, not by `validate.py`).
-- **46 s**: the restarted processor sat idle until the dead consumer's session timed out (45 s).
-- **redeliveries=3159, rows unchanged**: replaying the whole topic is harmless, because the writes are idempotent.
-- **2996 → 5992 on `transactions.clean`**: the clean topic is at-least-once. Each replay re-forwards every record.
-- Counts change on every run (the stream is random). The `PASS` lines must hold every time.
+## 2. Every file: purpose and the concept it demonstrates
 
-### Break it to learn it
-1. **Commit offsets before the DB write (at-most-once).** In `main.py`, move `consumer.commit(asynchronous=False)` to just after `consume()`, then add `raise RuntimeError("boom")` after `process_batch(...)` and rebuild.
+| File | Purpose | Key concept |
+|---|---|---|
+| `docker-compose.yml` | Starts Kafka, kafka-init, producer, Postgres, trainer, processor, api | Service dependencies (`service_healthy`, `service_completed_successfully`), volumes, listeners |
+| `.env.example` | Documents every setting (rates, users, DB credentials) | Config via environment, no secrets in git |
+| `.dockerignore` | Keeps `.venv`, `.git`, tests out of image builds | Small, fast build contexts |
+| `pyproject.toml` | ruff and pytest configuration | Linting, test discovery |
+| `requirements-dev.txt` | Everything needed to lint and test on the Mac / in CI | One install command for developers |
+| `producer/generator.py` | Users, merchants, normal txns, 4 fraud patterns, 4 dirty types | Pure, seeded, testable data generation; `FRAUD_RATE` as share of txns |
+| `producer/main.py` | Sends generated txns to Kafka at a fixed rate | Message keys, `acks=all`, idempotent producer, `flush()` on SIGTERM |
+| `producer/Dockerfile` | Producer image | Layer caching, exec-form CMD (PID 1 receives signals) |
+| `processor/validate.py` | Raw bytes → clean txn, or a rejection reason | Validate vs clean vs reject; NaN/bool edge cases |
+| `processor/store.py` | History query, idempotent inserts, quarantine | `ON CONFLICT DO NOTHING`, redelivery vs duplicate |
+| `processor/pipeline.py` | Consumer loop: validate → score → store → forward → commit | Consumer groups, manual offset commits, at-least-once, crash-only design |
+| `processor/Dockerfile` | Processor image, built from the repo root | Sharing code between services |
+| `model/features.py` | 7 features from a txn and the payer's earlier txns | Feature engineering; one function for training and serving |
+| `model/train.py` | Simulate data, time-ordered split, train 3 models, report P/R/F1 | Class imbalance, class weights, validation vs test, no accuracy |
+| `model/scorer.py` | Load the bundle, score one txn | Model serving; fixed feature order |
+| `model/Dockerfile` | Trainer image (one-shot job) | Batch jobs inside compose |
+| `api/app.py` | `/health`, `POST /score`, `/stats`, `/transactions/flagged` | Model serving over HTTP, strict validation, connection pool, 422 vs 503 |
+| `api/Dockerfile` | API image (uvicorn) | Healthcheck with the stdlib |
+| `db/schema.sql` | `transactions` + `quarantine` tables and indexes | PK as durable dedup, NUMERIC money, CHECK, partial index |
+| `benchmark/throughput.py` | Backlog of 20,000 messages → time to drain | Measuring throughput honestly (start-up included) |
+| `benchmark/api_latency.py` | 1,000 sequential `POST /score` → p50/p95/p99 | Latency percentiles, keep-alive |
+| `scripts/measure_all.sh` | One fresh run that produces every documented number | Reproducible results |
+| `results/measured_run.txt` | Output of that run | Evidence for every metric |
+| `.github/workflows/ci.yml` | ruff + pytest on every push, with a Postgres service | CI, service containers, `REQUIRE_DB=1` |
+| `tests/conftest.py` | Real-Postgres fixture, rolled back after each test | Integration tests that leave no data |
+| `tests/test_generator.py` | Fraud/dirty shapes, rates, determinism | Testing generated data |
+| `tests/test_validate.py` | One test per rule; every generator dirty type is caught | Contract between producer and processor |
+| `tests/test_store.py` | Inserts, redelivery vs duplicate, history, CHECK constraint | Idempotency, defence in depth |
+| `tests/test_features.py` | Each feature, cold start, window boundary, "only earlier" | Leakage-free features |
+| `tests/test_train.py` | Metrics present, weights raise recall, deterministic | Testing ML code |
+| `tests/test_pipeline.py` | `process_batch` with fake Kafka messages + stub model | Testing a consumer without Kafka |
+| `tests/test_api.py` | Every endpoint, wrong types, DB outage → 503 | TestClient, monkeypatch |
+
+---
+
+## 3. Core concepts, tied to the code
+
+### Kafka: topics, partitions, consumer groups, offsets
+- **Topic.** A named, append-only stream: `transactions.raw`, `.clean`, `.flagged`, created by `kafka-init`.
+- **Partition.** A topic is split into ordered logs (3 here). Order is guaranteed only *within* a partition, which is why `producer/main.py` uses `key=payer_vpa`: `hash(key) % 3` puts all of one payer's payments in one partition, in order. The features in step 6 depend on that order.
+- **Offset.** The position of a message in its partition. Kafka doesn't delete messages when they're read. Each consumer group stores how far it got (its *committed offset*).
+- **Consumer group.** `group.id: "processor"`. The group's members share the partitions, and each partition belongs to exactly one member. So 3 partitions means at most 3 processors working in parallel. A *different* group (say, an analytics job) would get its own complete copy of the stream. That's a big reason to use Kafka rather than a queue, where a message is gone once someone takes it.
+- **KRaft.** Kafka stores its own metadata (no ZooKeeper): `KAFKA_PROCESS_ROLES: broker,controller`.
+- **Listeners.** Containers connect to `kafka:9092` and your Mac to `localhost:9094`. The broker tells each client which address to reconnect to (the *advertised* listener), so it must be reachable from where that client runs.
+- **Session timeout.** A consumer that dies without leaving the group keeps its partitions until `session.timeout.ms` (45 s default) expires. The measured run shows this: section 7, "seconds from SIGKILL until processing resumed". A graceful stop calls `consumer.close()` and hands the partitions over immediately.
+
+### At-least-once delivery, and why dedup is needed
+- `enable.auto.commit=False`, and the order in `pipeline.py` is: DB commit → produce + flush → `consumer.commit()`. If the process dies anywhere before the last step, those messages are delivered again. **You may see a message twice, but you never lose one.**
+- *At-most-once* is the opposite order (commit offsets first). A crash then silently loses data, which is unacceptable for payments.
+- Redelivery is only safe if processing is **idempotent**. The `txn_id` PRIMARY KEY and `UNIQUE(kafka_partition, kafka_offset)` turn "delivered twice" into "stored once". The measured run replays the *entire* topic and checks that not a single row is added.
+- Dedup also handles a different problem: **genuine duplicates** (the same `txn_id` in two different messages, e.g. an app retry). Storing (partition, offset) on each row is how `store.save_txn` tells the two apart.
+- Effectively-once results = at-least-once delivery + idempotent writes. The `clean`/`flagged` topics are still at-least-once, so their readers must dedupe by `txn_id` too.
+
+### Data validation and cleaning
+- **Clean** what can be fixed without guessing (VPA case and whitespace). **Reject** what can't (a missing amount can't be invented). **Quarantine** rather than drop: bad data stays visible, countable (`/stats`) and replayable after a bug fix.
+- Edge cases a naive check misses, each with a test: `True` is an `int` in Python; `NaN` passes neither `> 0` nor `<= 0`; a timestamp without a timezone is ambiguous; `"100"` is not a number.
+- **Defence in depth:** `CHECK (amount > 0)` and `NUMERIC(12,2)` in the schema still protect the data if `validate.py` has a bug.
+- Fraud is **not** dirty data. `test_fraud_records_are_not_rejected` makes sure cleaning never throws away the suspicious-but-valid records.
+
+### Feature engineering
+Seven features per transaction (`model/features.py`), all from the payer's **earlier** transactions:
+
+| Feature | Catches |
+|---|---|
+| `txn_count_5min` | bursts (rapid repeats, fan-out) |
+| `distinct_payees_5min` | fan-out to many people vs repeats to one |
+| `amount_vs_avg` | unusually large amount for this user |
+| `is_new_device` | account takeover (only when there is history) |
+| `log_amount` | large amounts even without history |
+| `log_secs_since_last` | bursts are 0.1–0.9 s apart, normal users pay every few minutes |
+| `history_count` (capped at 10) | how much to trust the two history-based features |
+
+- **No train/serve skew:** training and serving call the same `compute_features`. Only the source of history differs (an in-memory list vs a SQL query), and both mean "this payer's earlier txns, `ts <` this one, newest 100".
+- **No leakage:** a txn never sees itself or the future (`h["ts"] < ts`, tested). Labels (`is_fraud`) are stored for evaluation and never used as features.
+
+### Precision vs recall (and why recall matters for fraud)
+- **Precision** = of the flagged txns, the share that really were fraud. **Recall** = of the real fraud, the share we flagged. **F1** = their harmonic mean.
+- For fraud, **recall matters most**: every missed fraud is real money lost and a victim. A false alarm costs a step-up check (an OTP, a call). But precision can't be ignored, because too many false alarms annoy customers and train analysts to ignore alerts.
+- **Accuracy is useless here.** With ~2% fraud, "never flag anything" is ~98% accurate and catches nothing. `train.py` prints that majority baseline on purpose.
+
+### Class imbalance
+- `FRAUD_RATE=0.02` makes about 2% of *transactions* fraud. `next_batch` converts that into how often a burst starts, using the average burst size.
+- `class_weight="balanced"` weights each class inversely to its frequency, so a missed fraud row costs ~49× a false alarm in the loss. The trainer reports the same logistic regression **with and without** weights, so you can see recall rise and precision fall.
+- **Time-ordered split (60/20/20):** train on the past, choose the model on the next period (validation), report on the latest (test). The model is never chosen by its test score.
+
+### Model serving
+- The model is trained once into a volume and **loaded once** per process (processor start-up, API `lifespan`), not per request.
+- The bundle stores `feature_names` and `threshold` with the model, so a feature-order mismatch can't happen.
+- scikit-learn, numpy and scipy are pinned identically in every image, because a pickle loaded by another version may break.
+- In the processor, scoring happens **inside the DB transaction**, so earlier txns of the same batch count as history (`test_earlier_txns_in_the_same_batch_count_as_history`).
+- The API uses a connection pool, strict Pydantic input, the pipeline's own validation, and correct status codes (422 = bad input, 503 = DB down).
+
+### Docker and CI
+- One command (`docker compose up --build`) builds 4 images and starts 7 services in dependency order. Healthchecks gate start-up.
+- The CI workflow runs ruff and pytest against a real Postgres service container. `REQUIRE_DB=1` makes DB tests *fail* rather than skip if the database is missing.
+
+---
+
+## 4. Ten "break it to learn it" exercises
+
+1. **Remove the message key.** In `producer/main.py` set `key=None`, rebuild, and consume with `--property print.partition=true`.
+   *What goes wrong:* one user's payments spread over all 3 partitions.
+   *Why:* without a key, the client spreads messages for balance. Per-user ordering, which the features depend on, is lost, and with several processors one user's history would be split across machines.
+2. **Break the advertised listener.** Change `EXTERNAL://localhost:9094` to `EXTERNAL://kafka:9094` and run `benchmark/throughput.py`.
+   *What goes wrong:* the client connects once, then fails with "Failed to resolve 'kafka:9094'".
+   *Why:* bootstrap only returns metadata. Clients then reconnect to the *advertised* address, and your Mac can't resolve the Docker-internal name `kafka`.
+3. **Commit offsets before the DB write.** Move `consumer.commit(asynchronous=False)` to just after `consume()` and add `raise RuntimeError("boom")` after `process_batch(...)`.
    *What goes wrong:* the accounting check fails, with fewer rows than raw messages.
-   *Why:* offsets were committed for a batch whose DB transaction rolled back. On restart, Kafka skips it, so those records are lost forever. This is exactly why the commit order matters.
-2. **Remove idempotency.** In `db/schema.sql`, change `txn_id UUID PRIMARY KEY` to `txn_id UUID NOT NULL` and remove `ON CONFLICT (txn_id) DO NOTHING` in `store.py`. Then `docker compose down -v && docker compose up --build -d` and do the offset reset replay (`kafka-consumer-groups.sh --group processor --topic transactions.raw --reset-offsets --to-earliest --execute` with the processor stopped).
-   *What goes wrong:* every transaction now appears twice. `SELECT count(*) - count(DISTINCT txn_id) FROM transactions` is no longer 0.
-   *Why:* at-least-once delivery without idempotent writes means duplicates. The database constraint is what turned "delivered twice" into "stored once".
-3. **Run two processors.** `docker compose up -d --scale processor=2`, then `kafka-consumer-groups.sh --describe --group processor`.
-   *What you'll see:* the 3 partitions split between two consumer IDs (2 + 1). Try `--scale processor=4`: one consumer gets no partition and sits idle.
-   *Why:* within a group, a partition is owned by exactly one consumer. That keeps per-key ordering, but it means partitions cap your parallelism. Also notice that dedup still works across both processors, because it lives in the shared database, not in either process's memory.
-
----
-
-## Phase 3: Features, model training, live scoring
-
-### What was built
-| File | Purpose | Key concept |
-|---|---|---|
-| `model/features.py` | 7 features from a txn + the payer's earlier txns | Feature engineering; one function for training AND serving (no train/serve skew) |
-| `model/train.py` | Simulates 200k labelled txns, trains 3 models, reports P/R/F1 on a held-out test set | Time-ordered split, class weights, model selection on validation |
-| `model/scorer.py` | Loads the model bundle, scores one txn | Model serving; fixed feature order |
-| `model/Dockerfile` + `trainer` service | Trains at `docker compose up` into a shared volume | One-shot jobs, `service_completed_successfully` |
-| `processor/pipeline.py` (was `main.py`) | Scores every valid txn, stores score + flag, sends flagged ones to `transactions.flagged` | Online feature lookup inside the batch's DB transaction |
-| `producer/generator.py` | `FRAUD_RATE` now means "share of transactions" (2%) | Class imbalance you control |
-
-### Key concepts
-- **Class imbalance.** About 2% of txns are fraud. A model that always says "not fraud" is ~98% *accurate* and catches nothing, which is why the trainer reports precision, recall and F1 and prints that majority baseline explicitly.
-- **Precision vs recall.** Precision is "of the txns we flagged, how many were fraud". Recall is "of the fraud, how much did we flag". For fraud, **recall matters most**: a missed fraud is lost money and a victim, while a false alarm costs an extra check (an OTP or a call). Precision still matters, because too many false alarms and users or ops teams start ignoring them.
-- **Class weights.** `class_weight="balanced"` makes each fraud row count ~49× more in the loss (98/2). The trainer shows the effect directly: the same logistic regression with and without weights.
-- **Time-ordered split.** Train on the first 60% of time, choose the model on the next 20%, report on the last 20%. A random split would let the model "see the future".
-- **No train/serve skew.** `compute_features(txn, history)` is the only feature code. Offline the history is an in-memory list, and online it's `store.fetch_history` (a SQL query using the `(payer_vpa, ts)` index). Both pass "this payer's earlier txns, `ts <` this one, newest 100".
-- **Two modelling bugs found and fixed while building** (good interview stories):
-  1. **Feature drift over time.** An uncapped `history_count` keeps growing, so the latest (test) period had values the forest never saw in training. Test recall came out far below validation recall. Trees can't extrapolate beyond the training range. The fix is to cap it at 10.
-  2. **A missing signal.** `many_payees` fraud was almost never caught. Normal users also pay a different payee each time, so the 5-minute counts alone can't tell a burst from normal activity. Adding `log_secs_since_last` (bursts are 0.1–0.9 s apart, normal users pay every few minutes) fixed it, and it became the most important feature (see `feature_importance` in the measured run).
-
-### Results
-The exact numbers are in the **Measured run** section (Phase 5), produced by `docker compose logs trainer` in that run.
-
-### Break it to learn it
-1. **Remove the class weights.** In `train.py`, delete `class_weight="balanced"` from the random forest and retrain (`PYTHONPATH=producer python model/train.py`).
+   *Why:* offsets were committed for a batch whose DB transaction rolled back, so on restart Kafka skips it and the records are lost (at-most-once).
+4. **Remove idempotency.** Drop `PRIMARY KEY` from `txn_id` in `db/schema.sql` and `ON CONFLICT (txn_id) DO NOTHING` from `store.py`. Then `down -v`, `up`, and reset the processor's offsets to the start.
+   *What goes wrong:* every transaction is stored twice (`count(*) - count(DISTINCT txn_id)` > 0).
+   *Why:* at-least-once delivery without idempotent writes means duplicates.
+5. **SIGKILL vs graceful stop.** Compare `docker compose kill processor; docker compose start processor` with `docker compose stop processor; docker compose start processor`, watching `kafka-consumer-groups.sh --describe --group processor`.
+   *What you'll see:* after a kill, processing pauses for about the session timeout. After a stop, it resumes almost immediately.
+   *Why:* a killed consumer never says goodbye, so the group waits until its session expires before reassigning its partitions.
+6. **Run more processors than partitions.** `docker compose up -d --scale processor=4`, then describe the group.
+   *What you'll see:* 3 consumers own one partition each and the 4th owns none.
+   *Why:* within a group a partition has exactly one owner. Partitions cap parallelism, so for 10,000 TPS you'd plan the partition count up front.
+7. **Remove the class weights.** Delete `class_weight="balanced"` from the random forest in `train.py` and run `PYTHONPATH=producer python model/train.py`.
    *What happens:* test recall drops and precision rises.
-   *Why:* without weights the loss is dominated by the 98% non-fraud rows, so the cheapest way to lower it is to say "not fraud" more often.
-2. **Use a random split.** Shuffle `X, y` before splitting.
-   *What happens:* validation and test scores move closer together. In this simulation the change is small, because the data's behaviour doesn't change over time.
-   *Why:* the model now trains on rows from the same period it's tested on, including other txns from the same fraud bursts. That's leakage: production never gives you tomorrow's data. With real data, where fraud tactics change month to month, a random split can make a model look far better than it will perform.
-3. **Create train/serve skew.** Change `h["ts"] < ts` to `h["ts"] <= ts` in `features.compute_features` **and** `ts < %s` to `ts <= %s` in `store.fetch_history`. Then rebuild, and replay (reset the processor's offsets, as in Phase 2).
-   *What happens:* training doesn't change, but replayed txns get different features and scores than on the first pass (e.g. `txn_count_5min` is one higher).
-   *Why:* offline, a txn is appended to history only *after* it's scored, so it never sees itself. Online, on a replay the txn is already in the DB, and `<=` counts it as its own history. The same code with different data timing is the classic train/serve skew.
+   *Why:* with 98% non-fraud rows, the cheapest way to lower the loss is to say "not fraud" more often.
+8. **Create train/serve skew.** Change `h["ts"] < ts` to `<=` in `features.py` and `ts < %s` to `<=` in `store.fetch_history`. Rebuild, then replay.
+   *What goes wrong:* replayed txns get a `txn_count_5min` one higher than the first time.
+   *Why:* offline, a txn is added to history after it's scored. Online, on a replay, it's already in the DB, so `<=` counts it as its own history.
+9. **Turn off strict input.** Remove `strict=True` from `Transaction` in `api/app.py` and `POST /score` with `"amount": "100"`.
+   *What goes wrong:* the request is accepted, because Pydantic silently converts the string.
+   *Why:* lax mode coerces types. For money it's safer to reject ambiguous input.
+10. **Open a DB connection per request.** In `/score`, replace `state["pool"].connection()` with `psycopg.connect(os.environ["DATABASE_URL"])` and rerun `benchmark/api_latency.py`.
+    *What goes wrong:* p50 latency goes up several-fold.
+    *Why:* every request now pays for a TCP connect plus PostgreSQL authentication before doing any work. Pools exist to pay that cost once.
 
 ---
 
-## Phase 4: FastAPI service
+## 5. 25 interview questions, with model answers from this code
 
-### What was built
-| File | Purpose | Key concept |
+1. **Why Kafka instead of a simple queue or a database table?**
+   Kafka keeps messages after they're read, so several independent consumer groups can each read the full stream (processor today, analytics or a second model tomorrow), and you can **replay** history (I reset offsets and reprocessed everything). Partitions give ordered, parallel processing per key. A queue deletes a message once consumed, and a DB table used as a queue means polling, locking and no built-in partitioned ordering.
+2. **What happens if the consumer crashes mid-stream?**
+   Offsets are committed only after the DB commit and the forward to the clean topic. A crash before that means the uncommitted batch is redelivered when it restarts. The DB transaction for the half-done batch rolls back, and redelivered messages hit `ON CONFLICT DO NOTHING`, so nothing is lost and nothing is stored twice. I tested it with SIGKILL: the accounting check `raw = transactions + quarantine` still held, with zero duplicate txn_ids. The cost is a pause of about the session timeout before the group reassigns the partitions.
+3. **How would this scale to 10,000 TPS?**
+   First, more partitions (e.g. 24–48) and one processor per partition in the same consumer group. One processor drained a backlog at 641 msg/s, so 10,000 TPS would need ~16 processors *if* they scaled linearly and the database kept up, which you'd have to measure. Second, cut the per-message work, which is the likely bottleneck (I haven't profiled it yet): one history query plus one single-row model call per txn. I'd batch the scoring (one `predict_proba` per batch), fetch history for the whole batch in one query, and keep per-user aggregates (count, sum, last timestamp, devices) in Redis or a feature store instead of re-reading 100 rows. Third, use bulk inserts (`COPY` / multi-row INSERT), partition the Postgres table by time, and run more Kafka brokers with replication factor 3.
+4. **Why not just use rules instead of a model?**
+   Rules are a good first layer: transparent and quick to change. But they're thresholds on one or two features, and fraud is a combination: a large amount is fine for a high spender, and many payees is fine during a festival. The model learns interactions across 7 features and gives a score you can threshold for the recall you need. In practice you use both: hard rules for known-bad cases, the model for ranking the rest.
+5. **What would you improve next?**
+   Batch scoring and a feature store for throughput; threshold tuning on a cost basis (cost of a missed fraud vs a false alarm); monitoring of score distribution and feature drift; model versioning (store model name/version on each row); retraining on real labelled outcomes; and a dead-letter replay tool for the quarantine table.
+6. **What is a partition and why key by `payer_vpa`?**
+   An ordered log that is a subset of a topic. Kafka guarantees order only within a partition. Keying by payer sends every payment of one user to the same partition, so the processor sees them in order, which the "earlier transactions" features require.
+7. **What is a consumer group?**
+   A set of consumers sharing a `group.id` that split a topic's partitions between them, each partition owned by one member. Kafka stores the group's committed offsets, which is how a restarted processor resumes.
+8. **At-least-once vs at-most-once vs exactly-once?**
+   At-least-once: commit after processing (duplicates possible, no loss), which is what I chose. At-most-once: commit before processing (loss possible). Exactly-once needs transactions spanning input and output. Kafka has them for Kafka-to-Kafka, but my output is Postgres, so I use at-least-once plus idempotent writes.
+9. **How do you tell a duplicate from a redelivery?**
+   Each row stores its Kafka (partition, offset). On a txn_id conflict, if the stored position equals the incoming message's, it's the same message redelivered. If it differs, it's another message carrying the same id, which is a genuine duplicate and gets quarantined.
+10. **Why quarantine instead of dropping bad records?**
+    So bad data is visible (counts by reason in `/stats`), debuggable (the raw message is kept), and replayable after fixing a bug. Silent drops hide upstream problems.
+11. **What is idempotency and where is it in your code?**
+    Doing an operation twice has the same effect as once. Here: `INSERT … ON CONFLICT (txn_id) DO NOTHING` for transactions, `ON CONFLICT (kafka_partition, kafka_offset) DO NOTHING` for quarantine, and the idempotent producer (`enable.idempotence=True`) so client retries don't duplicate messages on the broker.
+12. **Why `acks=all`?**
+    The broker confirms only once the write is durable on all in-sync replicas. With one broker that's just the leader, but the setting is right for production with replication factor 3.
+13. **Explain precision, recall and F1 using your results.**
+    Precision is the share of flagged txns that were truly fraud. Recall is the share of real fraud that was flagged. F1 balances them. The held-out numbers are in section 7. For fraud I care most about recall, while watching precision so alerts stay credible.
+14. **How did you handle class imbalance?**
+    `class_weight="balanced"` in both weighted models, evaluation with precision/recall/F1 instead of accuracy, and an explicit majority-class baseline that shows ~98% accuracy with zero recall. The trainer also shows the same logistic regression with and without weights.
+15. **Why a time-ordered split instead of a random one?**
+    In production you train on the past and predict the future. A random split lets the model learn from transactions after the ones it's tested on, including other txns from the same fraud burst, which inflates the scores.
+16. **How do you prevent train/serve skew?**
+    One function, `compute_features`, is used by the trainer and by both serving paths. The history definition is identical (earlier txns, newest 100), and the model bundle carries its feature order.
+17. **How did you choose between logistic regression and random forest?**
+    By validation F1, among the class-weighted models. The test set is used only to report the final numbers. The forest wins because fraud here is about *combinations* (e.g. short time since last txn *and* many payees), which trees capture without manual interaction terms.
+18. **Which feature matters most, and how do you know?**
+    The forest's `feature_importance` in the training report (section 7): `log_secs_since_last` is 0.5518, the next is 0.147. It dominates because bursts are sub-second apart. I added it after seeing that `many_payees` fraud was almost never caught with 5-minute counts alone.
+19. **Why is money stored as NUMERIC(12,2)?**
+    Floats can't represent most decimal amounts exactly (0.1 + 0.2 = 0.30000000000000004). NUMERIC is exact. `test_amount_is_stored_exactly` checks it.
+20. **What does `GET /health` check, and why does 503 vs 500 matter?**
+    That the model is loaded and the database answers `SELECT 1`. 503 means "temporarily unavailable, retry or route elsewhere" and is what load balancers and Docker healthchecks act on. 500 means a bug. A psycopg `OperationalError` handler maps DB outages to 503 on every endpoint.
+21. **Why a connection pool?**
+    Opening a Postgres connection costs a TCP handshake plus authentication. The pool pays that once and lends connections to requests. Removing it raises latency several-fold (exercise 10).
+22. **What does `docker compose up --build` actually start, in what order?**
+    Kafka (healthy) → kafka-init creates topics and exits → producer; Postgres (healthy); trainer trains and exits → processor and API. The ordering comes from `depends_on` conditions, so no service starts before what it needs exists.
+23. **How do you test a Kafka consumer without Kafka?**
+    `process_batch` takes any objects with `.value()`, `.partition()`, `.offset()` and `.error()`. `tests/test_pipeline.py` passes fake messages, runs against real Postgres inside a rolled-back transaction, and uses a stub model with predictable scores.
+24. **What did CI catch, or what is it for?**
+    It runs ruff and the full suite (including the real-Postgres tests, which must not skip) on every push, so a change that breaks validation rules, the schema or the API contract fails before merge. I ran the exact CI steps in a clean Linux container. It hasn't run on GitHub yet because the repo hasn't been pushed.
+25. **Tell me about a bug you found.**
+    The producer originally seeded its whole stream, so after a restart it re-sent identical txn_ids from the start, and the processor quarantined them all as duplicates. The fix was to seed only the user population and use fresh randomness for transactions. The measurement script restarts the producer mid-run and checks that injected dirty events equal quarantined records exactly. Others: a feature whose values kept growing over time made test recall far worse than validation (fixed by capping it), and my own benchmark once reported a recovery time that was too short because it read the offset before the kill.
+
+---
+
+## 6. Limitations and next steps (honest)
+
+- **Simulated data.** Users, amounts and fraud patterns come from `generator.py`, so the model is learning patterns I designed. The scores show the pipeline works, not that it would catch real fraud. Real labels arrive days later (chargebacks), not instantly.
+- **Features depend on the event rate.** A normal user's 5-minute count assumes ~20 txn/s across 2000 users. Different rates or user counts change the feature distribution, and the model would need retraining.
+- **Cold start.** Users with no history get neutral values, so early in a run the model relies on `log_amount` alone. Live scoring quality in section 7 includes this warm-up period.
+- **One message at a time.** Every valid txn costs one history query plus one single-row model call. That's the most likely limit on the measured 641 msg/s, but I haven't profiled it. Batch scoring and a feature store are the next steps.
+- **Mac vs Linux training differences.** Logistic regression is identical on both, but the random forest's metrics differ slightly between macOS and Linux builds of the same library versions. The documented numbers come from the Linux trainer container, which is what serves.
+- **Single broker, replication factor 1.** Fine for a laptop. Production needs 3 brokers, `min.insync.replicas=2` and monitoring.
+- **No authentication** on the API or the database beyond a local dev password. No TLS.
+- **No schema evolution.** Changing `db/schema.sql` requires `docker compose down -v`. A real system would use migrations (e.g. Alembic).
+- **The latency benchmark** is one sequential client on the same machine, through Docker Desktop's port forwarding. It is not a load test.
+- **CI has not run on GitHub yet**: it's validated with actionlint and by running the same steps in a clean Linux container.
+
+---
+
+## 7. Measured results (one run)
+
+**Source:** `results/measured_run.txt`, produced by `./scripts/measure_all.sh` on 2026-10-15 (Apple M4,
+16 GB RAM, macOS 26.3, Docker 29.8.2 with 10 CPUs and 7.7 GiB for containers). The services ran the code
+of commit `731974c` (Phase 4). The Phase 5 scripts that drove the run (`scripts/measure_all.sh`,
+`benchmark/*.py`) are committed in Phase 5.
+
+Every number in this file comes from that file. Counts change on every run (the stream is random), but
+every `PASS` line must pass every time, and the model numbers are identical on every Linux run (seed 42).
+
+### Model (trainer, held-out **test** set: last 20% of 200,000 txns by time, 917 fraud of 40,000)
+| Model | Precision | Recall | F1 |
+|---|---|---|---|
+| Majority baseline ("never fraud"; accuracy 0.9771) | 0.0 | 0.0 | 0.0 |
+| Logistic regression, unweighted | 0.8907 | 0.5245 | 0.6603 |
+| Logistic regression, `class_weight="balanced"` | 0.2293 | 0.8997 | 0.3654 |
+| **Random forest, `class_weight="balanced"` (selected by validation F1 0.8187)** | **0.7727** | **0.8899** | **0.8272** |
+
+- Fraud share of the training data: 0.0206 (FRAUD_RATE=0.02).
+- Class weights raise logistic regression's recall from 0.5245 to 0.8997, at the cost of precision (0.8907 → 0.2293). That's the trade-off you buy.
+- Selected model's test recall per pattern: rapid_repeat 0.8496 (266 rows), large_amount 1.0 (26), new_device_large 0.9583 (24), many_payees 0.9002 (601).
+- Where the misses are (live + backlog, step 11): of the 63 missed frauds, 59 were the **first** txn of their burst. That txn looks exactly like a normal payment because the burst hasn't started yet, so no single-txn model can catch it.
+- Feature importance: `log_secs_since_last` 0.5518, `amount_vs_avg` 0.147, `txn_count_5min` 0.1351, `log_amount` 0.0809, `distinct_payees_5min` 0.063, `is_new_device` 0.0132, `history_count` 0.009.
+
+### Live scoring (flagged column vs simulator labels)
+| Data | Txns | Labelled fraud | Precision | Recall | F1 |
+|---|---|---|---|---|---|
+| Live run (~3 min from a cold start) | 3773 | 66 (1.75%) | 0.5619 | 0.8939 | 0.6901 |
+| Backlog (20,000 messages, event times 6 h earlier) | 19026 | 503 (2.64%) | 0.7856 | 0.8887 | 0.8340 |
+
+Recall holds at ~0.89 in both. Precision is much lower in the live run because it starts from **cold start**: most users have little or no history, so `amount_vs_avg` and `is_new_device` carry no signal. The backlog, with ~17 minutes of simulated history, scores close to the held-out test set.
+
+### Pipeline correctness
+| Check | Result |
+|---|---|
+| Producer rate (configured 20 txn/s) | 20.0 txn/s; partitions 0/1/2 held 681/686/618 messages after 90 s |
+| Producer sent == messages in `transactions.raw` | PASS 3982 = 3982 |
+| Raw messages == transactions + quarantine | PASS 3982 = 3982 (3773 + 209) |
+| Dirty events injected == records quarantined | PASS 209 = 209 live, PASS 974 = 974 backlog |
+| Quarantine by reason (live) | duplicate_txn_id 59, malformed_vpa 49, missing_field 57, non_positive_amount 44 |
+| Duplicate txn_ids / unscored rows | PASS 0 / PASS 0 |
+| Recovery after SIGKILL | processing resumed 46 s after the kill (session timeout 45 s) |
+| Full replay of 23,982 messages | 23,982 redeliveries, 0 new rows: PASS 22,799 txns and 1,183 quarantine rows unchanged |
+
+### Performance
+| What | Result | Notes |
 |---|---|---|
-| `api/app.py` | `GET /health`, `POST /score`, `GET /stats`, `GET /transactions/flagged` | Model serving over HTTP; request validation; connection pooling |
-| `api/Dockerfile` + `api` service | Runs uvicorn on `localhost:8000` (docs at `/docs`) | Healthchecks, reusing code across services |
-| `tests/test_api.py` | TestClient tests against real Postgres + a small trained model | Testing an HTTP API without running a server |
+| Processor throughput | **641 msg/s** (20,000 messages in 31.2 s) | Backlog drain, **including processor start-up**. Each message is validated, its history fetched, featurised, scored by a 100-tree forest and inserted |
+| `POST /score` latency | **p50 1.56 ms, p95 1.76 ms, p99 2.05 ms** (max 12.94) | 1,000 sequential keep-alive requests after 50 warm-up, 500 real payers, 0 errors; same machine via Docker port forwarding |
+| Memory (long-running containers) | Kafka 575.5 MiB, API 110.4, processor 99.8, Postgres 31.3, producer 10.5 (≈ 827 MiB total) | `docker stats` during the live run; fits an 8 GB laptop |
 
-### Walk of one `POST /score` request
-1. FastAPI parses the JSON body into `Transaction`. With `strict=True`, `"amount": "100"` or `true` is rejected with 422 *before* our code runs.
-2. `validate.validate()` applies the **same** business rules as the pipeline (VPA format, self-payment, timestamp, …). A failure returns 422 with `{"reason": "malformed_vpa:payer"}`.
-3. A connection is borrowed from the pool, and `store.fetch_history()` loads the payer's earlier txns: the same query the processor uses.
-4. `features.compute_features()` → `scorer.score()`: the same code as live scoring, so the API and the pipeline always agree.
-5. The response contains the score, the flag, the threshold, the model name and the features. Nothing is stored: scoring is a read-only "what would happen" question.
+Not a benchmark: the backlog loader reports 20,000 messages "sent" in 0.1 s. That's too short to time
+meaningfully, and it mostly measures client-side batching, so I don't use it as a throughput claim.
 
-### Key concepts
-- **Model serving.** The model is loaded **once** at startup (`lifespan`), not per request. Loading a pickle on every request would add its full load time to every call.
-- **Connection pool.** Opening a PostgreSQL connection costs a network round trip plus authentication. `ConnectionPool(max_size=4)` keeps connections open and lends them to requests. `timeout=5` means a request waits at most 5 s for a connection.
-- **Two layers of validation.** Pydantic checks *shape and types* (is `amount` a number?), and `validate.py` checks *business rules* (is it positive? is the VPA well-formed?). Reusing `validate.py` means the API can never accept something the pipeline would quarantine.
-- **Correct status codes.** 422 = your request is wrong (with a reason). 503 = the database is down, retry later (the `psycopg.OperationalError` handler; tested by stopping Postgres). 500 = a bug in our code. Load balancers and Docker healthchecks act on these codes.
-- **Don't leak labels.** `/transactions/flagged` never returns `is_fraud`. A real alerts API wouldn't know the ground truth.
-- **Sync endpoints.** The endpoints are plain `def`, not `async def`. FastAPI runs them in a thread pool, so the blocking psycopg calls don't freeze the server.
+---
 
-### Break it to learn it
-1. **Remove `strict=True`.** Then `POST /score` with `"amount": "100"`.
-   *What happens:* the request is accepted, and Pydantic quietly converts the string to `100.0`.
-   *Why:* lax mode coerces types. For money it's safer to reject ambiguous input than to guess, which is why `test_score_rejects_wrong_types` exists.
-2. **Open a new connection per request.** Replace `state["pool"].connection()` in `/score` with `psycopg.connect(DATABASE_URL)` and rerun `benchmark/api_latency.py` (Phase 5).
-   *What happens:* p50 latency goes up.
-   *Why:* every request now pays for a TCP connect plus PostgreSQL authentication before doing any work.
-3. **Stop the database.** Run `docker compose stop postgres`, then `curl localhost:8000/health` and `/stats`.
-   *What you'll see:* both return 503. Start Postgres again and they return 200 without restarting the API.
-   *Why:* the pool notices broken connections and opens fresh ones. Delete the `exception_handler` and `/stats` returns a bare 500 instead, which wrongly tells clients it's a bug.
+## 8. Resume bullets (only numbers from the run above)
+
+- Built a real-time UPI-style payments pipeline (Kafka KRaft → Python consumer → PostgreSQL → FastAPI, 7 Docker Compose services) that validated, deduplicated, featurised and ML-scored a 20,000-message backlog at **641 msg/s** on a laptop, with **0 lost and 0 duplicate** transactions after a SIGKILL crash test and a full **23,982-message replay**.
+- Trained a class-weighted random forest on 200,000 simulated transactions (2.06% fraud) reaching **0.89 recall, 0.77 precision, 0.83 F1** on a time-ordered held-out set (unweighted logistic regression: 0.52 recall). It kept **0.89 recall** when scoring 19,026 backlog transactions live.
+- Served fraud scoring through FastAPI at **p50 1.56 ms / p95 1.76 ms** over 1,000 requests, and quarantined **1,183 of 1,183** injected bad records (malformed VPAs, missing fields, negative amounts, duplicate IDs), with the whole stack using **≈ 827 MiB** RAM.

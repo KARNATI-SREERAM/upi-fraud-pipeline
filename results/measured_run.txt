@@ -1,0 +1,159 @@
+== 0. Environment
+date: 2026-10-15T15:58:09Z  git: 731974c
+machine: Apple M4, 16 GB RAM, macOS 26.3
+docker: 29.8.2, 10 CPUs, 7.7 GiB available to containers
+== 1. Clean start (fresh Kafka, Postgres and model)
+containers: api=running kafka=running kafka-init=exited postgres=running processor=running producer=running trainer=exited
+== 2. Model training report (trainer container, held-out test set)
+{
+  "n_txns": 200000,
+  "fraud_share": 0.0206,
+  "train_rows": 120000,
+  "val_rows": 40000,
+  "test_rows": 40000,
+  "test_fraud_rows": 917,
+  "threshold": 0.5,
+  "majority_baseline": {
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "tp": 0,
+    "fp": 0,
+    "fn": 917,
+    "tn": 39083,
+    "accuracy": 0.9771
+  },
+  "models": {
+    "logreg_unweighted": {
+      "val": {
+        "precision": 0.886,
+        "recall": 0.5416,
+        "f1": 0.6722,
+        "tp": 404,
+        "fp": 52,
+        "fn": 342,
+        "tn": 39202
+      },
+      "test": {
+        "precision": 0.8907,
+        "recall": 0.5245,
+        "f1": 0.6603,
+        "tp": 481,
+        "fp": 59,
+        "fn": 436,
+        "tn": 39024
+      }
+    },
+    "logreg_balanced": {
+      "val": {
+        "precision": 0.1903,
+        "recall": 0.8954,
+        "f1": 0.3138,
+        "tp": 668,
+        "fp": 2843,
+        "fn": 78,
+        "tn": 36411
+      },
+      "test": {
+        "precision": 0.2293,
+        "recall": 0.8997,
+        "f1": 0.3654,
+        "tp": 825,
+        "fp": 2773,
+        "fn": 92,
+        "tn": 36310
+      }
+    },
+    "random_forest_balanced": {
+      "val": {
+        "precision": 0.758,
+        "recall": 0.8901,
+        "f1": 0.8187,
+        "tp": 664,
+        "fp": 212,
+        "fn": 82,
+        "tn": 39042
+      },
+      "test": {
+        "precision": 0.7727,
+        "recall": 0.8899,
+        "f1": 0.8272,
+        "tp": 816,
+        "fp": 240,
+        "fn": 101,
+        "tn": 38843
+      }
+    }
+  },
+  "selected": "random_forest_balanced",
+  "test_recall_by_pattern": {
+    "rapid_repeat": {
+      "rows": 266,
+      "recall": 0.8496
+    },
+    "large_amount": {
+      "rows": 26,
+      "recall": 1.0
+    },
+    "new_device_large": {
+      "rows": 24,
+      "recall": 0.9583
+    },
+    "many_payees": {
+      "rows": 601,
+      "recall": 0.9002
+    }
+  },
+  "feature_importance": {
+    "txn_count_5min": 0.1351,
+    "distinct_payees_5min": 0.063,
+    "amount_vs_avg": 0.147,
+    "is_new_device": 0.0132,
+    "log_amount": 0.0809,
+    "log_secs_since_last": 0.5518,
+    "history_count": 0.009
+  }
+}
+saved random_forest_balanced to /models/model.joblib
+== 3. Live run: 90 s at the configured 20 txn/s
+transactions.raw offsets per partition: transactions.raw:0:681 transactions.raw:1:686 transactions.raw:2:618
+== 4. SIGKILL the processor, restart it 5 s later
+seconds from SIGKILL until processing resumed: 46
+== 5. Restart the producer (a restart must not re-send old txn_ids)
+== 6. Memory, all long-running containers
+processor-1: 99.77MiB / 7.748GiB
+producer-1: 10.45MiB / 7.748GiB
+api-1: 110.4MiB / 7.748GiB
+postgres-1: 31.28MiB / 7.748GiB
+kafka-1: 575.5MiB / 7.748GiB
+== 7. Stop the producer, wait for lag 0, check accounting
+producer runs: 2, last reported rate: rate=20.0 txn/s
+PASS  producer sent == messages in transactions.raw: 3982 = 3982
+PASS  raw messages == transactions + quarantine: 3982 = 3982
+PASS  dirty events injected == records quarantined: 209 = 209
+PASS  duplicate txn_ids in transactions table: 0 = 0
+PASS  transactions without a fraud score: 0 = 0
+transactions=3773 quarantine=209
+quarantine by reason: duplicate_txn_id=59 malformed_vpa=49 missing_field=57 non_positive_amount=44
+live scoring (simulator labels vs flagged): txns=3773 labelled_fraud=66 (1.75%) tp=59 fp=46 fn=7 precision=0.5619 recall=0.8939 f1=0.6901
+transactions.flagged messages: 105  flagged rows: 105
+== 8. API
+GET /health: {"status":"ok","model":"random_forest_balanced"}
+GET /stats: {"transactions":3773,"flagged":105,"flag_rate":0.0278,"rejected":209,"rejected_by_reason":{"duplicate_txn_id":59,"malformed_vpa:payee":29,"malformed_vpa:payer":20,"missing_field:amount":9,"missing_field:device_id":5,"missing_field:location":7,"missing_field:merchant_category":4,"missing_field:payee_vpa":9,"missing_field:payer_vpa":11,"missing_field:timestamp":5,"missing_field:txn_id":7,"non_positive_amount":44}}
+POST /score: 1000 requests (after 50 warm-up), 500 distinct payers, errors=0
+latency ms: p50=1.56 p95=1.76 p99=2.05 mean=1.60 max=12.94
+== 9. Throughput: 20,000-message backlog through the processor
+backlog loaded: sent=20000 dirty_events=974 fraud_labelled_txns=503 in 0.1 s (170244 msg/s from the producer client)
+processor: 20000 messages stored in 31.2 s = 641 msg/s (includes processor start-up)
+PASS  rows after backlog == rows before + backlog messages: 23982 = 23982
+PASS  backlog dirty events == new quarantine rows: 974 = 974
+backlog scoring (simulator labels vs flagged): txns=19026 labelled_fraud=503 (2.64%) tp=447 fp=122 fn=56 precision=0.7856 recall=0.8887 f1=0.8340
+== 10. Full replay: reset the group's offsets to the start and reprocess everything
+processor counters for the backlog run: consumed=20000 inserted=19026 flagged=569 quarantined=974 redeliveries=0
+processor counters for the replay: consumed=23982 inserted=0 flagged=0 quarantined=0 redeliveries=23982
+PASS  transactions after replay (unchanged): 22799 = 22799
+PASS  quarantine after replay (unchanged): 1183 = 1183
+== Done (stack stopped, data volume kept). Output saved to results/measured_run.txt
+
+== 11. (run afterwards on this run's database, before any other change; query now part of scripts/measure_all.sh)
+missed frauds: 59 first-in-burst (no txn by this payer in the previous 1 s), 4 later-in-burst

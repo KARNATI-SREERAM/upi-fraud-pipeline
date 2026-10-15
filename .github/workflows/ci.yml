@@ -1,0 +1,41 @@
+# CI: on every push and pull request, lint with ruff and run the full pytest suite against a
+# real PostgreSQL (a service container), the same way the tests run locally.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pipeline
+          POSTGRES_PASSWORD: pipeline   # throwaway CI database, not a real secret
+          POSTGRES_DB: upi
+        ports:
+          - 5433:5432                   # same port the tests use locally
+        options: >-
+          --health-cmd "pg_isready -U pipeline -d upi"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      REQUIRE_DB: "1"   # DB tests must FAIL (not skip) if the database is missing
+      TEST_DATABASE_URL: postgresql://pipeline:pipeline@localhost:5433/upi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"        # same Python as the Docker images
+          cache: pip
+          cache-dependency-path: "**/requirements*.txt"
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+      - name: Lint
+        run: ruff check .
+      - name: Create database schema
+        run: psql "$TEST_DATABASE_URL" -f db/schema.sql
+      - name: Test
+        run: pytest -v
