@@ -1,5 +1,5 @@
 # Runs the whole pipeline locally with one command: `docker compose up --build`.
-# Kafka (KRaft) + topic creator + producer -> processor (with fraud model) -> PostgreSQL.
+# Kafka (KRaft) + topic creator + producer -> processor (with fraud model) -> PostgreSQL -> API.
 
 services:
   kafka:
@@ -112,6 +112,30 @@ services:
     volumes:
       - models:/models:ro           # read-only: only the trainer writes models
     restart: unless-stopped  # if it crashes, Docker restarts it and Kafka replays uncommitted messages
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      trainer:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pipeline}:${POSTGRES_PASSWORD:-pipeline}@postgres:5432/${POSTGRES_DB:-upi}
+      MODEL_PATH: /models/model.joblib
+    ports:
+      - "8000:8000"  # http://localhost:8000/docs for the interactive API page
+    volumes:
+      - models:/models:ro
+    healthcheck:
+      # The slim image has no curl, so use Python's standard library to call /health.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
 
 volumes:
   pgdata:

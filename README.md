@@ -7,7 +7,7 @@ transactions (including labelled fraud patterns and deliberately dirty records) 
 processor validates, cleans and deduplicates them, then stores them in PostgreSQL, quarantining
 bad records with a reason. Later phases add an ML fraud model and a FastAPI service.
 
-**Status:** Phase 3 of 5. Producer, Kafka (KRaft), processor, PostgreSQL and live fraud scoring are working.
+**Status:** Phase 4 of 5. Producer, Kafka (KRaft), processor, PostgreSQL, live fraud scoring and the FastAPI service are working.
 
 ## Architecture (Phase 2)
 
@@ -47,6 +47,15 @@ docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
 
 docker compose logs -f producer    # summary every 10 s: sent / delivered / fraud / dirty / rate
 docker compose logs -f processor   # consumed / inserted / quarantined by reason / redeliveries
+```
+
+## API (http://localhost:8000/docs)
+
+```bash
+curl localhost:8000/health
+curl localhost:8000/stats
+curl 'localhost:8000/transactions/flagged?limit=5'
+curl -X POST localhost:8000/score -H 'content-type: application/json' -d '{"txn_id":"6f1c2b9e-1d2a-4c3b-9e8f-0a1b2c3d4e5f","payer_vpa":"priya.sharma1@oksbi","payee_vpa":"food.store1@ybl","amount":350.0,"timestamp":"2026-10-15T10:00:00+00:00","device_id":"dev-1","location":"Pune","merchant_category":"food"}'
 ```
 
 ## Look at the results in PostgreSQL

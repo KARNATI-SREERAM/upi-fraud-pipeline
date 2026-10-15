@@ -10,14 +10,18 @@ import pytest
 DSN = os.getenv("TEST_DATABASE_URL", "postgresql://pipeline:pipeline@localhost:5433/upi")
 
 
-@pytest.fixture
-def db_conn():
+def connect_or_skip() -> psycopg.Connection:
     try:
-        conn = psycopg.connect(DSN, connect_timeout=2)
+        return psycopg.connect(DSN, connect_timeout=2)
     except psycopg.OperationalError:
         if os.getenv("REQUIRE_DB") == "1":
             raise
         pytest.skip(f"PostgreSQL not reachable at {DSN} (run `docker compose up -d postgres`)")
+
+
+@pytest.fixture
+def db_conn():
+    conn = connect_or_skip()
     yield conn
     conn.rollback()  # undo everything the test wrote
     conn.close()

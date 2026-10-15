@@ -194,3 +194,40 @@ The exact numbers are in the **Measured run** section (Phase 5), produced by `do
 3. **Create train/serve skew.** Change `h["ts"] < ts` to `h["ts"] <= ts` in `features.compute_features` **and** `ts < %s` to `ts <= %s` in `store.fetch_history`. Then rebuild, and replay (reset the processor's offsets, as in Phase 2).
    *What happens:* training doesn't change, but replayed txns get different features and scores than on the first pass (e.g. `txn_count_5min` is one higher).
    *Why:* offline, a txn is appended to history only *after* it's scored, so it never sees itself. Online, on a replay the txn is already in the DB, and `<=` counts it as its own history. The same code with different data timing is the classic train/serve skew.
+
+---
+
+## Phase 4: FastAPI service
+
+### What was built
+| File | Purpose | Key concept |
+|---|---|---|
+| `api/app.py` | `GET /health`, `POST /score`, `GET /stats`, `GET /transactions/flagged` | Model serving over HTTP; request validation; connection pooling |
+| `api/Dockerfile` + `api` service | Runs uvicorn on `localhost:8000` (docs at `/docs`) | Healthchecks, reusing code across services |
+| `tests/test_api.py` | TestClient tests against real Postgres + a small trained model | Testing an HTTP API without running a server |
+
+### Walk of one `POST /score` request
+1. FastAPI parses the JSON body into `Transaction`. With `strict=True`, `"amount": "100"` or `true` is rejected with 422 *before* our code runs.
+2. `validate.validate()` applies the **same** business rules as the pipeline (VPA format, self-payment, timestamp, …). A failure returns 422 with `{"reason": "malformed_vpa:payer"}`.
+3. A connection is borrowed from the pool, and `store.fetch_history()` loads the payer's earlier txns: the same query the processor uses.
+4. `features.compute_features()` → `scorer.score()`: the same code as live scoring, so the API and the pipeline always agree.
+5. The response contains the score, the flag, the threshold, the model name and the features. Nothing is stored: scoring is a read-only "what would happen" question.
+
+### Key concepts
+- **Model serving.** The model is loaded **once** at startup (`lifespan`), not per request. Loading a pickle on every request would add its full load time to every call.
+- **Connection pool.** Opening a PostgreSQL connection costs a network round trip plus authentication. `ConnectionPool(max_size=4)` keeps connections open and lends them to requests. `timeout=5` means a request waits at most 5 s for a connection.
+- **Two layers of validation.** Pydantic checks *shape and types* (is `amount` a number?), and `validate.py` checks *business rules* (is it positive? is the VPA well-formed?). Reusing `validate.py` means the API can never accept something the pipeline would quarantine.
+- **Correct status codes.** 422 = your request is wrong (with a reason). 503 = the database is down, retry later (the `psycopg.OperationalError` handler; tested by stopping Postgres). 500 = a bug in our code. Load balancers and Docker healthchecks act on these codes.
+- **Don't leak labels.** `/transactions/flagged` never returns `is_fraud`. A real alerts API wouldn't know the ground truth.
+- **Sync endpoints.** The endpoints are plain `def`, not `async def`. FastAPI runs them in a thread pool, so the blocking psycopg calls don't freeze the server.
+
+### Break it to learn it
+1. **Remove `strict=True`.** Then `POST /score` with `"amount": "100"`.
+   *What happens:* the request is accepted, and Pydantic quietly converts the string to `100.0`.
+   *Why:* lax mode coerces types. For money it's safer to reject ambiguous input than to guess, which is why `test_score_rejects_wrong_types` exists.
+2. **Open a new connection per request.** Replace `state["pool"].connection()` in `/score` with `psycopg.connect(DATABASE_URL)` and rerun `benchmark/api_latency.py` (Phase 5).
+   *What happens:* p50 latency goes up.
+   *Why:* every request now pays for a TCP connect plus PostgreSQL authentication before doing any work.
+3. **Stop the database.** Run `docker compose stop postgres`, then `curl localhost:8000/health` and `/stats`.
+   *What you'll see:* both return 503. Start Postgres again and they return 200 without restarting the API.
+   *Why:* the pool notices broken connections and opens fresh ones. Delete the `exception_handler` and `/stats` returns a bare 500 instead, which wrongly tells clients it's a bug.
