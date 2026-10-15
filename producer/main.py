@@ -42,7 +42,7 @@ def main():
     rate = float(os.getenv("TXNS_PER_SEC", "20"))
     fraud_rate = float(os.getenv("FRAUD_RATE", "0.02"))
     dirty_rate = float(os.getenv("DIRTY_RATE", "0.05"))
-    num_users = int(os.getenv("NUM_USERS", "500"))
+    num_users = int(os.getenv("NUM_USERS", "2000"))
     seed = int(os.getenv("SEED", "42"))
 
     # SEED fixes the user population, so the same users exist on every run. The transaction

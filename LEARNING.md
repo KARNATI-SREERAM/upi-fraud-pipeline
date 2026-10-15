@@ -156,3 +156,41 @@ How to read it:
 3. **Run two processors.** `docker compose up -d --scale processor=2`, then `kafka-consumer-groups.sh --describe --group processor`.
    *What you'll see:* the 3 partitions split between two consumer IDs (2 + 1). Try `--scale processor=4`: one consumer gets no partition and sits idle.
    *Why:* within a group, a partition is owned by exactly one consumer. That keeps per-key ordering, but it means partitions cap your parallelism. Also notice that dedup still works across both processors, because it lives in the shared database, not in either process's memory.
+
+---
+
+## Phase 3: Features, model training, live scoring
+
+### What was built
+| File | Purpose | Key concept |
+|---|---|---|
+| `model/features.py` | 7 features from a txn + the payer's earlier txns | Feature engineering; one function for training AND serving (no train/serve skew) |
+| `model/train.py` | Simulates 200k labelled txns, trains 3 models, reports P/R/F1 on a held-out test set | Time-ordered split, class weights, model selection on validation |
+| `model/scorer.py` | Loads the model bundle, scores one txn | Model serving; fixed feature order |
+| `model/Dockerfile` + `trainer` service | Trains at `docker compose up` into a shared volume | One-shot jobs, `service_completed_successfully` |
+| `processor/pipeline.py` (was `main.py`) | Scores every valid txn, stores score + flag, sends flagged ones to `transactions.flagged` | Online feature lookup inside the batch's DB transaction |
+| `producer/generator.py` | `FRAUD_RATE` now means "share of transactions" (2%) | Class imbalance you control |
+
+### Key concepts
+- **Class imbalance.** About 2% of txns are fraud. A model that always says "not fraud" is ~98% *accurate* and catches nothing, which is why the trainer reports precision, recall and F1 and prints that majority baseline explicitly.
+- **Precision vs recall.** Precision is "of the txns we flagged, how many were fraud". Recall is "of the fraud, how much did we flag". For fraud, **recall matters most**: a missed fraud is lost money and a victim, while a false alarm costs an extra check (an OTP or a call). Precision still matters, because too many false alarms and users or ops teams start ignoring them.
+- **Class weights.** `class_weight="balanced"` makes each fraud row count ~49× more in the loss (98/2). The trainer shows the effect directly: the same logistic regression with and without weights.
+- **Time-ordered split.** Train on the first 60% of time, choose the model on the next 20%, report on the last 20%. A random split would let the model "see the future".
+- **No train/serve skew.** `compute_features(txn, history)` is the only feature code. Offline the history is an in-memory list, and online it's `store.fetch_history` (a SQL query using the `(payer_vpa, ts)` index). Both pass "this payer's earlier txns, `ts <` this one, newest 100".
+- **Two modelling bugs found and fixed while building** (good interview stories):
+  1. **Feature drift over time.** An uncapped `history_count` keeps growing, so the latest (test) period had values the forest never saw in training. Test recall came out far below validation recall. Trees can't extrapolate beyond the training range. The fix is to cap it at 10.
+  2. **A missing signal.** `many_payees` fraud was almost never caught. Normal users also pay a different payee each time, so the 5-minute counts alone can't tell a burst from normal activity. Adding `log_secs_since_last` (bursts are 0.1–0.9 s apart, normal users pay every few minutes) fixed it, and it became the most important feature (see `feature_importance` in the measured run).
+
+### Results
+The exact numbers are in the **Measured run** section (Phase 5), produced by `docker compose logs trainer` in that run.
+
+### Break it to learn it
+1. **Remove the class weights.** In `train.py`, delete `class_weight="balanced"` from the random forest and retrain (`PYTHONPATH=producer python model/train.py`).
+   *What happens:* test recall drops and precision rises.
+   *Why:* without weights the loss is dominated by the 98% non-fraud rows, so the cheapest way to lower it is to say "not fraud" more often.
+2. **Use a random split.** Shuffle `X, y` before splitting.
+   *What happens:* validation and test scores move closer together. In this simulation the change is small, because the data's behaviour doesn't change over time.
+   *Why:* the model now trains on rows from the same period it's tested on, including other txns from the same fraud bursts. That's leakage: production never gives you tomorrow's data. With real data, where fraud tactics change month to month, a random split can make a model look far better than it will perform.
+3. **Create train/serve skew.** Change `h["ts"] < ts` to `h["ts"] <= ts` in `features.compute_features` **and** `ts < %s` to `ts <= %s` in `store.fetch_history`. Then rebuild, and replay (reset the processor's offsets, as in Phase 2).
+   *What happens:* training doesn't change, but replayed txns get different features and scores than on the first pass (e.g. `txn_count_5min` is one higher).
+   *Why:* offline, a txn is appended to history only *after* it's scored, so it never sees itself. Online, on a replay the txn is already in the DB, and `<=` counts it as its own history. The same code with different data timing is the classic train/serve skew.

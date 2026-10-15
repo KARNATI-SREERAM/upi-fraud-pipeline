@@ -1,5 +1,5 @@
 # Runs the whole pipeline locally with one command: `docker compose up --build`.
-# Kafka (KRaft) + topic creator + producer -> processor -> PostgreSQL.
+# Kafka (KRaft) + topic creator + producer -> processor (with fraud model) -> PostgreSQL.
 
 services:
   kafka:
@@ -63,7 +63,7 @@ services:
       TXNS_PER_SEC: ${TXNS_PER_SEC:-20}
       FRAUD_RATE: ${FRAUD_RATE:-0.02}
       DIRTY_RATE: ${DIRTY_RATE:-0.05}
-      NUM_USERS: ${NUM_USERS:-500}
+      NUM_USERS: ${NUM_USERS:-2000}
       SEED: ${SEED:-42}
     restart: unless-stopped
 
@@ -85,17 +85,34 @@ services:
       timeout: 5s
       retries: 10
 
+  trainer:
+    # One-shot: trains the fraud model (deterministic, seed 42) into the shared `models` volume, then exits.
+    build:
+      context: .                    # project root, so the image can copy shared code
+      dockerfile: model/Dockerfile
+    volumes:
+      - models:/models
+    restart: "no"
+
   processor:
-    build: ./processor
+    build:
+      context: .
+      dockerfile: processor/Dockerfile
     depends_on:
       kafka-init:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
+      trainer:
+        condition: service_completed_successfully  # the model file must exist before scoring
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       DATABASE_URL: postgresql://${POSTGRES_USER:-pipeline}:${POSTGRES_PASSWORD:-pipeline}@postgres:5432/${POSTGRES_DB:-upi}
+      MODEL_PATH: /models/model.joblib
+    volumes:
+      - models:/models:ro           # read-only: only the trainer writes models
     restart: unless-stopped  # if it crashes, Docker restarts it and Kafka replays uncommitted messages
 
 volumes:
   pgdata:
+  models:

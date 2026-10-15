@@ -7,7 +7,7 @@ transactions (including labelled fraud patterns and deliberately dirty records) 
 processor validates, cleans and deduplicates them, then stores them in PostgreSQL, quarantining
 bad records with a reason. Later phases add an ML fraud model and a FastAPI service.
 
-**Status:** Phase 2 of 5. Producer, Kafka (KRaft), processor and PostgreSQL are working.
+**Status:** Phase 3 of 5. Producer, Kafka (KRaft), processor, PostgreSQL and live fraud scoring are working.
 
 ## Architecture (Phase 2)
 

@@ -99,9 +99,14 @@ def test_same_seed_gives_same_stream():
     assert stream(7) != stream(8)
 
 
-def test_rates_roughly_respected(world, rng):
-    kinds = [generator.next_batch(world, rng, NOW, 0.1, 0.2)[0] for _ in range(5000)]
-    fraud = sum(k.startswith("fraud") for k in kinds) / len(kinds)
+def test_fraud_rate_is_share_of_transactions(world, rng):
+    # FRAUD_RATE=0.02 must give ~2% fraud TRANSACTIONS, even though one fraud event is a burst.
+    txns = [t for _ in range(30000) for t in generator.next_batch(world, rng, NOW, 0.02, 0.0)[1]]
+    share = sum(t["is_fraud"] for t in txns) / len(txns)
+    assert 0.015 < share < 0.025
+
+
+def test_dirty_rate_is_share_of_events(world, rng):
+    kinds = [generator.next_batch(world, rng, NOW, 0.02, 0.2)[0] for _ in range(5000)]
     dirty = sum(k.startswith("dirty") for k in kinds) / len(kinds)
-    assert 0.08 < fraud < 0.12
     assert 0.17 < dirty < 0.23

@@ -1,8 +1,6 @@
 # Integration tests for processor/store.py against a REAL PostgreSQL (the one from docker compose).
-# Skipped automatically if Postgres isn't reachable. Each test runs inside a transaction that is
-# rolled back afterwards, so no test data is left behind.
+# Uses the `cur` fixture from conftest.py: skipped if Postgres isn't reachable, rolled back after.
 
-import os
 import uuid
 
 import psycopg
@@ -10,20 +8,7 @@ import pytest
 
 import store
 
-DSN = os.getenv("TEST_DATABASE_URL", "postgresql://pipeline:pipeline@localhost:5433/upi")
 TEST_PARTITION = 999  # a partition number real data never uses, so we can't collide with it
-
-
-@pytest.fixture
-def cur():
-    try:
-        conn = psycopg.connect(DSN, connect_timeout=2)
-    except psycopg.OperationalError:
-        pytest.skip(f"PostgreSQL not reachable at {DSN} (run `docker compose up -d postgres`)")
-    with conn.cursor() as c:
-        yield c
-    conn.rollback()
-    conn.close()
 
 
 def make_txn():
@@ -69,3 +54,14 @@ def test_db_rejects_non_positive_amount(cur):
     # Defence in depth: even if validate.py had a bug, the CHECK constraint stops bad money data.
     with pytest.raises(psycopg.errors.CheckViolation):
         store.save_txn(cur, {**make_txn(), "amount": -1}, TEST_PARTITION, 1)
+
+
+def test_fetch_history_returns_only_earlier_txns_newest_first(cur):
+    payer = f"hist.{uuid.uuid4().hex[:8]}@testbank"
+    for i, ts in enumerate(["2026-01-01T12:00:00+00:00", "2026-01-01T12:01:00+00:00",
+                            "2026-01-01T12:02:00+00:00"]):
+        store.save_txn(cur, {**make_txn(), "payer_vpa": payer, "timestamp": ts}, TEST_PARTITION, i)
+    hist = store.fetch_history(cur, payer, "2026-01-01T12:02:00+00:00", limit=10)
+    assert [h["ts"].minute for h in hist] == [1, 0]  # 12:02 itself excluded, newest first
+    [latest] = store.fetch_history(cur, payer, "2026-01-01T12:02:00+00:00", limit=1)
+    assert latest["ts"].minute == 1

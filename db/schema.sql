@@ -14,6 +14,8 @@ CREATE TABLE transactions (
     merchant_category TEXT NOT NULL,
     is_fraud          BOOLEAN,  -- simulator ground truth, used only for training/evaluation
     fraud_pattern     TEXT,
+    fraud_score       REAL,     -- model's probability of fraud (0..1), set by the processor
+    flagged           BOOLEAN NOT NULL DEFAULT false,  -- fraud_score >= model threshold
     -- Where in Kafka this row came from. Lets us tell a Kafka redelivery (same offset)
     -- apart from a genuine duplicate sent twice (different offset).
     kafka_partition   INT NOT NULL,
@@ -21,8 +23,10 @@ CREATE TABLE transactions (
     processed_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Phase 3 features ask "this payer's txns in the last 5 minutes"; this index makes that fast.
+-- Features ask "this payer's recent txns before time t"; this index makes that fast.
 CREATE INDEX transactions_payer_ts ON transactions (payer_vpa, ts);
+-- GET /transactions/flagged reads only flagged rows, newest first. A partial index stores just those.
+CREATE INDEX transactions_flagged_ts ON transactions (ts DESC) WHERE flagged;
 
 -- Rejected records, kept with a reason instead of silently dropped, so they can be inspected or replayed.
 CREATE TABLE quarantine (

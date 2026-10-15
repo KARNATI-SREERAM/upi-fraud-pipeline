@@ -18,6 +18,11 @@ CITIES = ["Mumbai", "Delhi", "Bengaluru", "Hyderabad", "Chennai", "Kolkata",
 MERCHANT_CATEGORIES = ["grocery", "food", "fuel", "electronics", "travel", "utilities"]
 
 FRAUD_PATTERNS = ["rapid_repeat", "large_amount", "new_device_large", "many_payees"]
+RAPID_REPEAT_COUNT = (5, 8)   # txns in one rapid_repeat burst (min, max)
+MANY_PAYEES_COUNT = (8, 15)   # distinct payees in one many_payees burst
+# Average number of txns one fraud event creates (patterns are picked with equal probability).
+# Needed to turn "2% of transactions are fraud" into "how often should a fraud event start".
+MEAN_FRAUD_BURST = (sum(RAPID_REPEAT_COUNT) / 2 + 1 + 1 + sum(MANY_PAYEES_COUNT) / 2) / 4
 DIRTY_TYPES = ["missing_field", "duplicate", "malformed_vpa", "negative_amount"]
 REQUIRED_FIELDS = ["txn_id", "payer_vpa", "payee_vpa", "amount", "timestamp", "device_id",
                    "location", "merchant_category"]
@@ -129,7 +134,7 @@ def fraud_txns(pattern: str, world: World, rng: random.Random, now: datetime) ->
     if pattern == "rapid_repeat":
         # Same payer -> same payee, many times in seconds (e.g. a stolen phone being drained).
         payee, category = _pick_payee(world, user, rng)
-        times = _burst_times(now, rng.randint(5, 8), rng)
+        times = _burst_times(now, rng.randint(*RAPID_REPEAT_COUNT), rng)
         return [_txn(user, payee, category, user.typical_amount * rng.uniform(0.8, 1.2),
                      device, user.city, ts, rng, **label) for ts in times]
 
@@ -148,7 +153,7 @@ def fraud_txns(pattern: str, world: World, rng: random.Random, now: datetime) ->
     if pattern == "many_payees":
         # Money mule fan-out: one payer sends to many different people quickly.
         others = [u for u in world.users if u.vpa != user.vpa]
-        payees = rng.sample(others, rng.randint(8, 15))
+        payees = rng.sample(others, rng.randint(*MANY_PAYEES_COUNT))
         times = _burst_times(now, len(payees), rng)
         return [_txn(user, p.vpa, "p2p", user.typical_amount * rng.uniform(0.3, 1.0),
                      device, user.city, ts, rng, **label) for p, ts in zip(payees, times)]
@@ -191,14 +196,19 @@ def next_batch(world: World, rng: random.Random, now: datetime,
                fraud_rate: float, dirty_rate: float) -> tuple[str, list[dict]]:
     """Decide what kind of event happens next. Returns (kind, records).
 
+    fraud_rate = target share of TRANSACTIONS that are fraud (e.g. 0.02 = 2%).
+    dirty_rate = share of EVENTS that are dirty.
     kind is only for the producer's log counters; it is NOT put into the records, so the
     processor has to detect dirty data by itself, just like in a real system.
     """
+    # One fraud event makes ~MEAN_FRAUD_BURST txns, every other event ~1. Solving
+    #   share = p*B / (p*B + (1 - p))   for p   gives the line below.
+    p_fraud_event = fraud_rate / (MEAN_FRAUD_BURST * (1 - fraud_rate) + fraud_rate)
     r = rng.random()
-    if r < fraud_rate:
+    if r < p_fraud_event:
         pattern = rng.choice(FRAUD_PATTERNS)
         return f"fraud:{pattern}", fraud_txns(pattern, world, rng, now)
-    if r < fraud_rate + dirty_rate:
+    if r < p_fraud_event + dirty_rate:
         dirty_type = rng.choice(DIRTY_TYPES)
         return f"dirty:{dirty_type}", make_dirty(dirty_type, normal_txn(world, rng, now), rng)
     return "normal", [normal_txn(world, rng, now)]

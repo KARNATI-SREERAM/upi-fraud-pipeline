@@ -1,0 +1,9 @@
+# Keep the build context small for images built from the project root (trainer, processor, api).
+.venv
+.git
+**/__pycache__
+.pytest_cache
+.ruff_cache
+results
+tests
+*.joblib

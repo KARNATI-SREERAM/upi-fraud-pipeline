@@ -5,7 +5,7 @@
 line-length = 100
 target-version = "py312"
 # Tell ruff our own modules live here, so `import generator` is sorted as first-party.
-src = ["producer", "processor", "tests"]
+src = ["producer", "processor", "model", "tests"]
 
 [tool.ruff.lint]
 # E/W = style errors, F = real bugs (unused imports, undefined names), I = import order
@@ -13,5 +13,5 @@ select = ["E", "W", "F", "I"]
 
 [tool.pytest.ini_options]
 # Lets tests do `import generator` / `import validate` without packaging the folders.
-pythonpath = ["producer", "processor"]
+pythonpath = ["producer", "processor", "model"]
 testpaths = ["tests"]

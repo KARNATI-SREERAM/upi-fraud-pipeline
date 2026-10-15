@@ -1,9 +1,10 @@
-# Processor entry point: consumes transactions.raw, validates/cleans each record, deduplicates,
-# stores results in PostgreSQL, and forwards clean records to transactions.clean.
+# Processor entry point: consumes transactions.raw, validates/cleans each record, scores it with
+# the fraud model, deduplicates, stores results in PostgreSQL, and forwards clean records to
+# transactions.clean and flagged ones to transactions.flagged.
 #
 # Delivery guarantee: AT-LEAST-ONCE. For each batch the order is:
-#   1. write every row in one DB transaction -> 2. DB commit -> 3. produce to clean + flush
-#   -> 4. commit Kafka offsets.
+#   1. write every row in one DB transaction -> 2. DB commit -> 3. produce to clean/flagged +
+#   flush -> 4. commit Kafka offsets.
 # A crash anywhere before step 4 means Kafka re-sends the batch. That is safe because every DB
 # write is idempotent (see store.py). Never commit offsets before the data is saved: a crash
 # in between would silently lose those records.
@@ -17,11 +18,14 @@ from collections import Counter
 
 from confluent_kafka import Consumer, Producer
 
+import features
+import scorer
 import store
 import validate
 
 RAW_TOPIC = "transactions.raw"
 CLEAN_TOPIC = "transactions.clean"
+FLAGGED_TOPIC = "transactions.flagged"
 BATCH_SIZE = 100
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -49,8 +53,16 @@ def to_text(raw: bytes | None) -> str:
     return (raw or b"").decode("utf-8", errors="replace").replace("\x00", "")
 
 
-def process_batch(msgs, cur, counts: Counter) -> list[dict]:
-    """Validate and store one batch. Returns the clean txns to forward to the clean topic."""
+def score_txn(cur, txn: dict, bundle: dict) -> dict:
+    """Add fraud_score and flagged to a clean txn, using the payer's history from the DB."""
+    # History is read inside the same DB transaction, so earlier txns of this batch count too.
+    history = store.fetch_history(cur, txn["payer_vpa"], txn["timestamp"], features.HISTORY_LIMIT)
+    score = scorer.score(bundle, features.compute_features(txn, history))
+    return {**txn, "fraud_score": round(score, 4), "flagged": score >= bundle["threshold"]}
+
+
+def process_batch(msgs, cur, counts: Counter, bundle: dict) -> list[dict]:
+    """Validate, score and store one batch. Returns the scored txns to forward."""
     to_forward = []
     for msg in msgs:
         if msg.error():
@@ -67,9 +79,13 @@ def process_batch(msgs, cur, counts: Counter) -> list[dict]:
                 counts["redeliveries"] += 1
             continue
 
+        # Score BEFORE saving so the row is stored with its score. For a redelivery the
+        # features are identical (history is "ts < this txn"), so the score is too.
+        txn = score_txn(cur, txn, bundle)
         outcome = store.save_txn(cur, txn, p, o)
         if outcome == "inserted":
             counts["inserted"] += 1
+            counts["flagged"] += txn["flagged"]
             to_forward.append(txn)
         elif outcome == "redelivery":
             # Already saved, but we can't know whether it reached the clean topic before the
@@ -86,8 +102,9 @@ def process_batch(msgs, cur, counts: Counter) -> list[dict]:
 
 def log_counts(counts: Counter, start: float):
     quarantined = {k.split(":", 1)[1]: v for k, v in counts.items() if k.startswith("quarantined:")}
-    log.info("consumed=%d inserted=%d quarantined=%d redeliveries=%d rate=%.1f msg/s reasons=%s",
-             counts["consumed"], counts["inserted"], sum(quarantined.values()),
+    log.info("consumed=%d inserted=%d flagged=%d quarantined=%d redeliveries=%d rate=%.1f msg/s "
+             "reasons=%s", counts["consumed"], counts["inserted"], counts["flagged"],
+             sum(quarantined.values()),
              counts["redeliveries"], counts["consumed"] / (time.monotonic() - start),
              dict(sorted(quarantined.items())))
 
@@ -108,6 +125,8 @@ def main():
     producer = Producer({"bootstrap.servers": bootstrap, "acks": "all",
                          "enable.idempotence": True})
     conn = store.connect(dsn)
+    bundle = scorer.load(os.getenv("MODEL_PATH", "model/model.joblib"))
+    log.info("loaded model %s (threshold %.2f)", bundle["name"], bundle["threshold"])
 
     signal.signal(signal.SIGTERM, handle_stop)
     signal.signal(signal.SIGINT, handle_stop)
@@ -124,15 +143,20 @@ def main():
                 # process exits without committing offsets, Docker restarts it, and the batch is
                 # re-read ("crash and replay" is simpler and safer than partial recovery code).
                 with conn.cursor() as cur:
-                    to_forward = process_batch(msgs, cur, counts)
+                    to_forward = process_batch(msgs, cur, counts, bundle)
                 conn.commit()
 
-                # Step 3: forward clean records, and wait until Kafka has them.
+                # Step 3: forward clean records (and flagged ones to the alerts topic), and wait
+                # until Kafka has them.
                 for txn in to_forward:
-                    producer.produce(CLEAN_TOPIC, key=txn["payer_vpa"],
-                                     value=json.dumps(txn).encode(), on_delivery=on_delivery)
+                    value = json.dumps(txn).encode()
+                    producer.produce(CLEAN_TOPIC, key=txn["payer_vpa"], value=value,
+                                     on_delivery=on_delivery)
+                    if txn["flagged"]:
+                        producer.produce(FLAGGED_TOPIC, key=txn["payer_vpa"], value=value,
+                                         on_delivery=on_delivery)
                 if producer.flush(10) > 0 or delivery_failures:
-                    raise RuntimeError("could not deliver to clean topic; not committing offsets")
+                    raise RuntimeError("could not deliver to Kafka; not committing offsets")
 
                 # Step 4: only now tell Kafka this batch is done.
                 consumer.commit(asynchronous=False)

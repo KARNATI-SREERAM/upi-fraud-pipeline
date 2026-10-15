@@ -5,9 +5,24 @@ import psycopg
 
 
 def connect(dsn: str) -> psycopg.Connection:
-    # autocommit is off (the default): nothing is saved until main.py calls conn.commit(),
+    # autocommit is off (the default): nothing is saved until pipeline.py calls conn.commit(),
     # so a whole batch is saved together or not at all.
     return psycopg.connect(dsn)
+
+
+def fetch_history(cur: psycopg.Cursor, payer_vpa: str, before_ts, limit: int) -> list[dict]:
+    """This payer's most recent `limit` stored txns strictly before `before_ts` (feature input)."""
+    # Served by the (payer_vpa, ts) index, so it stays fast as the table grows.
+    cur.execute(
+        """
+        SELECT ts, amount, device_id, payee_vpa FROM transactions
+        WHERE payer_vpa = %s AND ts < %s
+        ORDER BY ts DESC LIMIT %s
+        """,
+        (payer_vpa, before_ts, limit),
+    )
+    return [{"ts": ts, "amount": float(amount), "device_id": dev, "payee_vpa": payee}
+            for ts, amount, dev, payee in cur.fetchall()]
 
 
 def save_txn(cur: psycopg.Cursor, txn: dict, partition: int, offset: int) -> str:
@@ -16,13 +31,14 @@ def save_txn(cur: psycopg.Cursor, txn: dict, partition: int, offset: int) -> str
         """
         INSERT INTO transactions (txn_id, payer_vpa, payee_vpa, amount, ts, device_id, location,
                                   merchant_category, is_fraud, fraud_pattern,
-                                  kafka_partition, kafka_offset)
+                                  fraud_score, flagged, kafka_partition, kafka_offset)
         VALUES (%(txn_id)s, %(payer_vpa)s, %(payee_vpa)s, %(amount)s, %(timestamp)s, %(device_id)s,
                 %(location)s, %(merchant_category)s, %(is_fraud)s, %(fraud_pattern)s,
-                %(partition)s, %(offset)s)
+                %(fraud_score)s, %(flagged)s, %(partition)s, %(offset)s)
         ON CONFLICT (txn_id) DO NOTHING
         """,
-        {**txn, "partition": partition, "offset": offset},
+        # Unscored txns (e.g. in tests) default to no score and not flagged.
+        {"fraud_score": None, "flagged": False, **txn, "partition": partition, "offset": offset},
     )
     if cur.rowcount == 1:
         return "inserted"
