@@ -1,0 +1,2 @@
+# Kafka client used by the producer. Wraps librdkafka (C), the same engine many prod systems use.
+confluent-kafka==2.6.1

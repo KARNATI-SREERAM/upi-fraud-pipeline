@@ -1,0 +1,17 @@
+# Tool config only (this project is not a pip-installable package).
+# ruff = linter, pytest = test runner; CI runs both.
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# Tell ruff our own modules live here, so `import generator` is sorted as first-party.
+src = ["producer", "tests"]
+
+[tool.ruff.lint]
+# E/W = style errors, F = real bugs (unused imports, undefined names), I = import order
+select = ["E", "W", "F", "I"]
+
+[tool.pytest.ini_options]
+# Lets tests do `import generator` without packaging the producer folder.
+pythonpath = ["producer"]
+testpaths = ["tests"]

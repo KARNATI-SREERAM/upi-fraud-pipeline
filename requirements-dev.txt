@@ -1,0 +1,5 @@
+# Tools for running tests and lint on your Mac (not installed in the Docker images).
+pytest==8.3.4
+ruff==0.8.4
+# Same Kafka client as the producer, so you can run scripts against localhost:9094 from your Mac.
+-r producer/requirements.txt
