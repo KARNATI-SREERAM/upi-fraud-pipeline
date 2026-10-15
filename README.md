@@ -1,14 +1,10 @@
 # Real-time UPI transaction pipeline with fraud detection
 
+[![CI](https://github.com/KARNATI-SREERAM/upi-fraud-pipeline/actions/workflows/ci.yml/badge.svg)](https://github.com/KARNATI-SREERAM/upi-fraud-pipeline/actions/workflows/ci.yml)
+
 <!-- What the project is, how to run and test it, and its measured results (all from one run). -->
 
-A local streaming pipeline in the payments domain, started with one command. A simulator produces
-UPI-style transactions into Kafka, including labelled fraud patterns and deliberately dirty records.
-A processor validates, cleans, deduplicates and **scores each transaction with an ML model**, then
-stores the results in PostgreSQL, quarantining bad records with a reason. A FastAPI service exposes
-health, scoring, stats and flagged transactions.
-
-Study guide (walkthrough, concepts, exercises, interview Q&A): **[LEARNING.md](LEARNING.md)**.
+**Kafka → validation/dedup → ML fraud scoring → PostgreSQL → FastAPI, running locally with one command, with effectively-once storage (no lost or duplicate rows) across crashes and replays.**
 
 ## Architecture
 
@@ -34,6 +30,40 @@ flowchart LR
 
 - **At-least-once, effectively-once storage.** Per batch: DB commit → produce to clean/flagged → commit Kafka offsets. Writes are idempotent (`txn_id` primary key; `UNIQUE(partition, offset)` on quarantine), so crashes and replays never lose or duplicate a row.
 - **No train/serve skew.** The trainer, the processor and the API all compute features with the same function (`model/features.py`).
+
+## Measured results
+
+Every number here comes from **one run** of one command, saved in
+[results/measured_run.txt](results/measured_run.txt) (Apple M4, 16 GB RAM, Docker Desktop with 7.7 GiB, 2026-10-15):
+
+```bash
+./scripts/measure_all.sh      # ~10-15 min; deletes existing pipeline data first
+```
+
+| What | Result |
+|---|---|
+| Model on held-out test set (40,000 txns, 917 fraud) | random forest, balanced: **precision 0.7727, recall 0.8899, F1 0.8272** |
+| Same test set, logistic regression unweighted vs balanced | recall 0.5245 → 0.8997 (precision 0.8907 → 0.2293) |
+| Live scoring, 19,026-txn backlog (labels vs flags) | precision 0.7856, recall 0.8887, F1 0.8340 |
+| Live scoring, first ~3 min from cold start (3,773 txns) | precision 0.5619, recall 0.8939, F1 0.6901 |
+| Processor throughput (backlog drain, start-up included) | **641 msg/s** (20,000 messages in 31.2 s) |
+| `POST /score` latency, 1,000 sequential requests | **p50 1.56 ms, p95 1.76 ms**, p99 2.05 ms |
+| Accounting | 3,982 raw = 3,773 stored + 209 quarantined; 209 of 209 dirty records caught (974 of 974 in the backlog) |
+| SIGKILL of the processor | 0 lost, 0 duplicates; resumed after 46 s (Kafka session timeout 45 s) |
+| Full replay of 23,982 messages | 0 new rows |
+| Memory (long-running containers) | ≈ 827 MiB total (Kafka 575.5 MiB) |
+
+Counts vary per run (the stream is random). The `PASS` checks must hold every time, and the model numbers
+are identical on every Linux run. Details and caveats are in [LEARNING.md §7](LEARNING.md#7-measured-results-one-run).
+## What it is
+
+A local streaming pipeline in the payments domain, started with one command. A simulator produces
+UPI-style transactions into Kafka, including labelled fraud patterns and deliberately dirty records.
+A processor validates, cleans, deduplicates and **scores each transaction with an ML model**, then
+stores the results in PostgreSQL, quarantining bad records with a reason. A FastAPI service exposes
+health, scoring, stats and flagged transactions.
+
+Study guide (walkthrough, concepts, exercises, interview Q&A): **[LEARNING.md](LEARNING.md)**.
 
 ## Run
 
@@ -88,28 +118,3 @@ call). So the model is tuned for high recall, with precision kept high enough th
 **Accuracy is misleading:** with ~2% fraud, a model that never flags anything is 97.71% accurate on the
 test set and catches nothing. The trainer uses `class_weight="balanced"` and reports precision, recall and F1
 on a time-ordered held-out set.
-
-## Measured results
-
-Every number here comes from **one run** of one command, saved in
-[results/measured_run.txt](results/measured_run.txt) (Apple M4, 16 GB RAM, Docker Desktop with 7.7 GiB, 2026-10-15):
-
-```bash
-./scripts/measure_all.sh      # ~10-15 min; deletes existing pipeline data first
-```
-
-| What | Result |
-|---|---|
-| Model on held-out test set (40,000 txns, 917 fraud) | random forest, balanced: **precision 0.7727, recall 0.8899, F1 0.8272** |
-| Same test set, logistic regression unweighted vs balanced | recall 0.5245 → 0.8997 (precision 0.8907 → 0.2293) |
-| Live scoring, 19,026-txn backlog (labels vs flags) | precision 0.7856, recall 0.8887, F1 0.8340 |
-| Live scoring, first ~3 min from cold start (3,773 txns) | precision 0.5619, recall 0.8939, F1 0.6901 |
-| Processor throughput (backlog drain, start-up included) | **641 msg/s** (20,000 messages in 31.2 s) |
-| `POST /score` latency, 1,000 sequential requests | **p50 1.56 ms, p95 1.76 ms**, p99 2.05 ms |
-| Accounting | 3,982 raw = 3,773 stored + 209 quarantined; 209 of 209 dirty records caught (974 of 974 in the backlog) |
-| SIGKILL of the processor | 0 lost, 0 duplicates; resumed after 46 s (Kafka session timeout 45 s) |
-| Full replay of 23,982 messages | 0 new rows |
-| Memory (long-running containers) | ≈ 827 MiB total (Kafka 575.5 MiB) |
-
-Counts vary per run (the stream is random). The `PASS` checks must hold every time, and the model numbers
-are identical on every Linux run. Details and caveats are in [LEARNING.md §7](LEARNING.md#7-measured-results-one-run).
