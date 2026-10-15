@@ -39,6 +39,8 @@ Every number here comes from **one run** of one command, saved in
 ```bash
 ./scripts/measure_all.sh      # ~10-15 min; deletes existing pipeline data first
 ```
+The `git: 731974c` line in that file refers to the Phase 4 commit as it was before commit authors were rewritten for publishing; it is now `9f2bbae` (same code, only the author email changed).
+
 
 | What | Result |
 |---|---|
