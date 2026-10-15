@@ -1,0 +1,3 @@
+# Kafka client (same as producer) and the PostgreSQL driver (psycopg 3, with prebuilt binary).
+confluent-kafka==2.6.1
+psycopg[binary]==3.2.3

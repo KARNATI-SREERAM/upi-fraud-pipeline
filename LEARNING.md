@@ -52,3 +52,107 @@ We'll decide in Phase 3 whether to lower `FRAUD_RATE` to get a realistic class i
 3. **Kill the broker mid-stream.** Run `docker compose stop kafka` for 20 s, then `docker compose start kafka`, while watching `docker compose logs -f producer`.
    *What goes wrong:* `delivered` stops increasing while `sent` keeps growing, and the gap is the messages sitting in the local buffer.
    *Why:* `produce()` only buffers locally, and librdkafka keeps retrying. If the outage is longer than `message.timeout.ms` (default 5 min), those messages fail, and `failed` goes up. When the broker returns, the buffer drains and `delivered` catches up. Try `docker compose kill producer` (SIGKILL, no flush) during an outage and compare `sent` with the offsets: the buffered messages are lost.
+
+---
+
+## Phase 2: Processor (validate, clean, dedup, quarantine → PostgreSQL)
+
+### What was built
+| File | Purpose | Key concept |
+|---|---|---|
+| `db/schema.sql` | `transactions` and `quarantine` tables | Primary key as durable dedup; `UNIQUE(partition, offset)`; NUMERIC for money; CHECK constraint |
+| `processor/validate.py` | Turns one raw message into a clean txn, or a rejection reason | Validate vs clean vs reject; pure functions |
+| `processor/store.py` | Idempotent inserts; tells "redelivery" apart from "duplicate" | `INSERT ... ON CONFLICT DO NOTHING`, `rowcount` |
+| `processor/main.py` | Consumer loop: batch → DB commit → forward to clean → commit offsets | Consumer groups, manual offset commits, at-least-once |
+| `tests/test_validate.py` | One test per rule + every generator dirty type is caught | Testing the contract between two services |
+| `tests/test_store.py` | Runs against real Postgres, rolls back after each test | Integration tests, skip when infrastructure is missing |
+
+### Walk of one message through the processor
+1. `consumer.consume(100, timeout=1.0)` returns up to 100 messages from the partitions assigned to this consumer.
+2. For each message, `validate.validate(msg.value())` parses the JSON, checks the 8 required fields, cleans the VPAs (strip + lowercase), then checks VPA format, self-payment, amount and timestamp. The first failure becomes the reason, e.g. `malformed_vpa:payer`.
+3. If it's **rejected**, `store.save_quarantine()` writes the raw message + reason + (partition, offset).
+4. If it's **valid**, `store.save_txn()` runs `INSERT ... ON CONFLICT (txn_id) DO NOTHING`.
+   - If 1 row was written → `inserted`.
+   - If 0 rows were written, the txn_id exists already. If the stored (partition, offset) matches this message, it's a `redelivery` (Kafka sent the same message again), so skip it. Otherwise it's a `duplicate` (a different message with the same id), so quarantine it as `duplicate_txn_id`.
+5. After the whole batch, `conn.commit()` makes all of its rows durable at once.
+6. Inserted txns are produced to `transactions.clean`, and `producer.flush()` waits until Kafka has them.
+7. `consumer.commit()` tells Kafka "group `processor` has finished up to here". Only now will a restart skip these messages.
+
+### Key concepts (tied to the code)
+- **Consumer group.** `group.id: "processor"` in `main.py`. All consumers with the same group id share a topic's partitions, and each partition goes to exactly one member. With 3 partitions, up to 3 processors can work in parallel, and a 4th would sit idle. A *different* group id gets its own full copy of the stream (that's how the API or an analytics job could read the same data independently).
+- **Offsets and commits.** Kafka doesn't delete a message when you read it. Instead, each group stores a *committed offset* per partition, meaning "read up to here". `enable.auto.commit=False` means *we* decide when to commit: only after the data is safe in Postgres. You can see this with `kafka-consumer-groups.sh --describe --group processor` (CURRENT-OFFSET, LOG-END-OFFSET, LAG).
+- **At-least-once.** Commit order: DB first, offsets last. If we crash in between, Kafka re-sends those messages, so you may see a message **more than once but never zero times**. The alternative, **at-most-once** (commit offsets first), loses data on a crash. For payments, losing a transaction is worse than seeing it twice, provided the second time is harmless.
+- **Idempotent writes (why dedup is needed).** At-least-once only works if processing a message twice has the same effect as once. The `txn_id` PRIMARY KEY + `ON CONFLICT DO NOTHING` does that for good records, and `UNIQUE(kafka_partition, kafka_offset)` does it for quarantined ones. Measured (see *Measured results* below): a full replay of 3159 messages gave `redeliveries=3159` and **0** new rows.
+- **Redelivery vs duplicate.** These are two different problems that look alike. A *redelivery* is the same Kafka message again, with the same offset. A *duplicate* is two separate messages with the same txn_id (e.g. the sender's app retried). Storing (partition, offset) on each row is how the code tells them apart.
+- **Exactly-once?** Kafka has transactions for Kafka-to-Kafka exactly-once, but here we write to Postgres, which is outside Kafka. The practical pattern is *at-least-once delivery + idempotent processing = effectively-once results*. The DB table is effectively-once. `transactions.clean` is at-least-once: after the replay it held 5992 messages for 2996 rows, so its readers must dedupe by txn_id too. A crash can cause the same effect on a smaller scale. If the kill lands after the DB commit but before the offset commit, the restarted processor re-forwards that batch. In the measured run the kill didn't land there (`redeliveries=0` after the restart).
+- **Validate vs clean vs quarantine.** *Clean* what is safe to fix without guessing: VPA case and whitespace. *Reject* what you can't fix: a missing amount can't be invented. *Quarantine* rather than drop, so that bad data is visible, countable (the `/stats` endpoint in Phase 4 will use it) and replayable after a bug fix. Note that fraud is **not** dirty data: `test_fraud_records_are_not_rejected` makes sure cleaning never throws away the suspicious-but-valid records the model needs.
+- **Defence in depth.** `CHECK (amount > 0)` in the schema stops bad money data even if `validate.py` has a bug (`test_db_rejects_non_positive_amount`). NUMERIC(12,2) stores money exactly: `0.1 + 0.2` is stored as `0.30`, not `0.30000000000000004`.
+- **Crash-only design.** `main.py` has no clever partial-recovery code. Any exception exits the process, Docker restarts it (`restart: unless-stopped`), and Kafka replays the uncommitted batch. The DB transaction rolls back, so a half-written batch never exists.
+- **Session timeout (seen in the crash test).** After `docker compose kill processor`, processing resumed only 46 s after the kill, even though the new processor started 5 s after it. The killed consumer never said goodbye, so the group waited for its `session.timeout.ms` (45 s default) to expire before giving its partitions to the new member. A graceful `docker compose stop` calls `consumer.close()`, which leaves the group at once, so there's no wait.
+
+### Bug found during Phase 2 (a good interview story)
+The Phase 1 producer seeded *everything* with `SEED=42`, including txn_ids. When the producer was restarted, it re-sent the same txn_ids from the start, and the processor correctly quarantined them all as duplicates. The fix is in `producer/main.py`: the seed now only fixes the **user population**, and the stream uses fresh randomness on every run. `scripts/verify_phase2.sh` restarts the producer mid-run and checks this: injected dirty events = quarantined records exactly (163 = 163 in the measured run). Any re-sent txn_id would show up as an extra `duplicate_txn_id`.
+
+### Measured results (one run, one command)
+Every Phase 2 number in this file and in README.md comes from this single run (MacBook, Apple Silicon,
+Docker Desktop with 7.7 GiB, 2026-10-15). To reproduce it from the project folder:
+
+```bash
+./scripts/verify_phase2.sh      # about 4 minutes; WARNING: deletes existing pipeline data first
+```
+
+What the script does, in order:
+1. `docker compose down -v`, then `up --build`: empty Kafka and Postgres, run for 60 s.
+2. `docker compose kill processor` (SIGKILL), `start` it 5 s later. Times how long until a new offset is committed.
+3. `docker compose restart producer`: checks that a restart doesn't re-send old txn_ids.
+4. `docker stats`: memory while everything runs.
+5. Stops the producer, waits for consumer lag 0, then checks the accounting (`PASS`/`FAIL` lines).
+6. Stops the processor, resets the group's offsets to the start (`--reset-offsets --to-earliest`), replays everything, and checks that no rows were added.
+
+Output of the measured run, unedited:
+```
+== 1. Clean start (fresh Kafka + Postgres), run for 60 s
+== 2. SIGKILL the processor (no clean shutdown), restart it 5 s later
+seconds from SIGKILL until processing resumed: 46
+== 3. Restart the producer (a restart must not re-send old txn_ids)
+== 4. Memory, all containers running
+processor-1: 25.63MiB / 7.748GiB
+producer-1: 10.2MiB / 7.748GiB
+postgres-1: 29.06MiB / 7.748GiB
+kafka-1: 478.6MiB / 7.748GiB
+== 5. Stop the producer, wait for the processor to catch up (lag 0)
+producer runs: 2, last reported rate: rate=20.0 txn/s
+PASS  producer sent == messages in transactions.raw: 3159 = 3159
+PASS  raw messages == transactions + quarantine: 3159 = 3159
+PASS  dirty events injected == records quarantined: 163 = 163
+PASS  duplicate txn_ids in transactions table: 0 = 0
+transactions=2996 quarantine=163
+quarantine by reason: duplicate_txn_id=42 malformed_vpa=49 missing_field=42 non_positive_amount=30
+fraud-labelled transactions: 239 of 2996 (8.0%)
+== 6. Full replay: reset the group's offsets to the start and reprocess everything
+processor counters after the SIGKILL restart: consumed=1958 inserted=1860 quarantined=98 redeliveries=0
+processor counters for the replay: consumed=3159 inserted=0 quarantined=0 redeliveries=3159
+PASS  transactions after replay (unchanged): 2996 = 2996
+PASS  quarantine after replay (unchanged): 163 = 163
+transactions.clean messages: before replay=2996 after replay=5992
+== Done (stack stopped, data volume kept)
+```
+
+How to read it:
+- **3159 = 2996 + 163**: every raw message ended up in exactly one table. Nothing was lost and nothing was stored twice, despite the SIGKILL.
+- **163 = 163**: every injected dirty record was caught, and no clean record was rejected. Of the 163, 42 are `duplicate_txn_id` (genuine duplicates, caught by the primary key, not by `validate.py`).
+- **46 s**: the restarted processor sat idle until the dead consumer's session timed out (45 s).
+- **redeliveries=3159, rows unchanged**: replaying the whole topic is harmless, because the writes are idempotent.
+- **2996 → 5992 on `transactions.clean`**: the clean topic is at-least-once. Each replay re-forwards every record.
+- Counts change on every run (the stream is random). The `PASS` lines must hold every time.
+
+### Break it to learn it
+1. **Commit offsets before the DB write (at-most-once).** In `main.py`, move `consumer.commit(asynchronous=False)` to just after `consume()`, then add `raise RuntimeError("boom")` after `process_batch(...)` and rebuild.
+   *What goes wrong:* the accounting check fails, with fewer rows than raw messages.
+   *Why:* offsets were committed for a batch whose DB transaction rolled back. On restart, Kafka skips it, so those records are lost forever. This is exactly why the commit order matters.
+2. **Remove idempotency.** In `db/schema.sql`, change `txn_id UUID PRIMARY KEY` to `txn_id UUID NOT NULL` and remove `ON CONFLICT (txn_id) DO NOTHING` in `store.py`. Then `docker compose down -v && docker compose up --build -d` and do the offset reset replay (`kafka-consumer-groups.sh --group processor --topic transactions.raw --reset-offsets --to-earliest --execute` with the processor stopped).
+   *What goes wrong:* every transaction now appears twice. `SELECT count(*) - count(DISTINCT txn_id) FROM transactions` is no longer 0.
+   *Why:* at-least-once delivery without idempotent writes means duplicates. The database constraint is what turned "delivered twice" into "stored once".
+3. **Run two processors.** `docker compose up -d --scale processor=2`, then `kafka-consumer-groups.sh --describe --group processor`.
+   *What you'll see:* the 3 partitions split between two consumer IDs (2 + 1). Try `--scale processor=4`: one consumer gets no partition and sits idle.
+   *Why:* within a group, a partition is owned by exactly one consumer. That keeps per-key ordering, but it means partitions cap your parallelism. Also notice that dedup still works across both processors, because it lives in the shared database, not in either process's memory.

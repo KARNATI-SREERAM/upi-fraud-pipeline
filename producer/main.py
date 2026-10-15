@@ -45,8 +45,11 @@ def main():
     num_users = int(os.getenv("NUM_USERS", "500"))
     seed = int(os.getenv("SEED", "42"))
 
-    rng = random.Random(seed)
-    world = generator.make_world(num_users, rng)
+    # SEED fixes the user population, so the same users exist on every run. The transaction
+    # stream uses fresh randomness: if it were seeded too, a restarted producer would re-send
+    # the exact same txn_ids, and the processor would quarantine them all as duplicates.
+    world = generator.make_world(num_users, random.Random(seed))
+    rng = random.Random()
 
     producer = Producer({
         "bootstrap.servers": bootstrap,
@@ -101,8 +104,9 @@ def main():
 
     log.info("stopping: flushing buffered messages")
     remaining = producer.flush(10)  # block until everything in the buffer is delivered
-    log.info("final: sent=%d delivered=%d failed=%d undelivered=%d",
-             counts["sent"], counts["delivered"], counts["failed"], remaining)
+    log.info("final: sent=%d delivered=%d failed=%d undelivered=%d fraud_events=%d dirty_events=%d",
+             counts["sent"], counts["delivered"], counts["failed"], remaining,
+             counts["fraud_events"], counts["dirty_events"])
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 # Runs the whole pipeline locally with one command: `docker compose up --build`.
-# Phase 1: a single Kafka broker (KRaft mode), a one-shot topic creator, and the producer.
+# Kafka (KRaft) + topic creator + producer -> processor -> PostgreSQL.
 
 services:
   kafka:
@@ -66,3 +66,36 @@ services:
       NUM_USERS: ${NUM_USERS:-500}
       SEED: ${SEED:-42}
     restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-pipeline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-pipeline}
+      POSTGRES_DB: ${POSTGRES_DB:-upi}
+    ports:
+      - "5433:5432"  # 5433 on your Mac, so it won't clash with a Postgres you already run on 5432
+    volumes:
+      - pgdata:/var/lib/postgresql/data           # data survives `docker compose down` (not `down -v`)
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro  # run once, on first start
+    healthcheck:
+      # $$ escapes $ for compose, so the shell inside the container expands the variable.
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  processor:
+    build: ./processor
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      DATABASE_URL: postgresql://${POSTGRES_USER:-pipeline}:${POSTGRES_PASSWORD:-pipeline}@postgres:5432/${POSTGRES_DB:-upi}
+    restart: unless-stopped  # if it crashes, Docker restarts it and Kafka replays uncommitted messages
+
+volumes:
+  pgdata:
