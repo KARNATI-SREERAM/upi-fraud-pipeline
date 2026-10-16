@@ -116,3 +116,53 @@ def test_database_outage_returns_503(client, monkeypatch):
     monkeypatch.setitem(app.state, "pool", DownPool())  # restored automatically after the test
     assert client.get("/stats").status_code == 503
     assert client.get("/health").status_code == 503
+
+
+# ---------------- HTML pages ----------------
+
+def test_dashboard_renders_stats_and_flagged_row(client):
+    with connect_or_skip() as conn, conn.cursor() as cur:
+        t = body()
+        store.save_txn(cur, {**t, "is_fraud": None, "fraud_score": 0.91, "fraud_pattern": None,
+                             "flagged": True}, TEST_PARTITION, 30_000)
+        conn.commit()
+    r = client.get("/")
+    assert r.status_code == 200 and r.headers["content-type"].startswith("text/html")
+    assert "Transactions stored" in r.text and "Rejected records by reason" in r.text
+    assert t["payer_vpa"] in r.text  # newest flagged txn is on the page
+    assert 'http-equiv="refresh"' in r.text
+
+
+def test_score_page_without_params_shows_prefilled_form(client):
+    r = client.get("/ui/score")
+    assert r.status_code == 200
+    assert '<form method="get"' in r.text and 'name="payer_vpa" value="priya@oksbi"' in r.text
+    assert "Fraud score" not in r.text  # nothing scored yet
+
+
+def test_score_page_scores_valid_txn(client):
+    b = body()
+    r = client.get("/ui/score", params={**b, "amount": "450"})  # forms send text, not numbers
+    assert r.status_code == 200
+    assert "Fraud score" in r.text
+    for name in features.FEATURE_NAMES:
+        assert f"<td>{name}</td>" in r.text
+
+
+@pytest.mark.parametrize("override, reason", [
+    ({"payer_vpa": "no-at-sign"}, "malformed_vpa:payer"),
+    ({"amount": "abc"}, "bad_amount"),
+    ({"amount": "-5"}, "non_positive_amount"),
+    ({"device_id": ""}, "missing_field:device_id"),  # empty box counts as missing
+])
+def test_score_page_shows_validator_reason(client, override, reason):
+    r = client.get("/ui/score", params=body(**override))
+    assert r.status_code == 200
+    assert f"Reason: <b>{reason}</b>" in r.text
+
+
+def test_score_page_escapes_html(client):
+    # Autoescaping: user input must come back as text, never as a live <script> tag (XSS).
+    r = client.get("/ui/score", params=body(location="<script>alert(1)</script>"))
+    assert "<script>alert(1)</script>" not in r.text
+    assert "&lt;script&gt;" in r.text

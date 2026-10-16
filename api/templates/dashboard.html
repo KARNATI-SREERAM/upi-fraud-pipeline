@@ -1,0 +1,49 @@
+{# Dashboard at GET /: pipeline counters, why records were rejected, and the newest flagged
+   transactions. Data comes from read_stats() and read_flagged() in app.py, the same functions
+   behind GET /stats and GET /transactions/flagged. #}
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+
+{# The browser reloads the page every 5 s: simple polling with no JavaScript. #}
+{% block head %}<meta http-equiv="refresh" content="5">{% endblock %}
+
+{% block content %}
+<h1>Live pipeline dashboard</h1>
+<p class="muted">Refreshes every 5 seconds.</p>
+
+<div class="cards">
+  <div class="card"><div class="label">Transactions stored</div><div class="value">{{ stats.transactions }}</div></div>
+  <div class="card"><div class="label">Flagged as fraud</div><div class="value">{{ stats.flagged }}</div></div>
+  <div class="card"><div class="label">Flag rate</div><div class="value">{{ "%.2f"|format(stats.flag_rate * 100) }}%</div></div>
+  <div class="card"><div class="label">Rejected (quarantined)</div><div class="value">{{ stats.rejected }}</div></div>
+</div>
+
+<h2>Rejected records by reason</h2>
+{% if stats.rejected_by_reason %}
+<div class="table-wrap"><table>
+  <tr><th>Reason</th><th>Count</th></tr>
+  {% for reason, count in stats.rejected_by_reason.items() %}
+  <tr><td>{{ reason }}</td><td>{{ count }}</td></tr>
+  {% endfor %}
+</table></div>
+{% else %}
+<p class="muted">No rejected records yet.</p>
+{% endif %}
+
+<h2>Latest flagged transactions</h2>
+{% if flagged %}
+<div class="table-wrap"><table>
+  <tr><th>Time (UTC)</th><th>Payer</th><th>Payee</th><th>Amount (₹)</th><th>Device</th>
+      <th>Location</th><th>Category</th><th>Fraud score</th></tr>
+  {% for t in flagged %}
+  <tr>
+    <td>{{ t.timestamp[:19] }}</td><td>{{ t.payer_vpa }}</td><td>{{ t.payee_vpa }}</td>
+    <td>{{ "%.2f"|format(t.amount) }}</td><td>{{ t.device_id }}</td><td>{{ t.location }}</td>
+    <td>{{ t.merchant_category }}</td><td>{{ "%.3f"|format(t.fraud_score) }}</td>
+  </tr>
+  {% endfor %}
+</table></div>
+{% else %}
+<p class="muted">No flagged transactions yet.</p>
+{% endif %}
+{% endblock %}

@@ -1,15 +1,22 @@
 # FastAPI service over the pipeline's PostgreSQL: health check, score one transaction, stats, and
 # recent flagged transactions. It reuses the processor's validation, history query, features and
 # model, so POST /score gives the same answer the live pipeline would.
+# It also serves two server-rendered HTML pages (Jinja2 templates, no JavaScript): a dashboard at /
+# and a score form at /ui/score. They call the same functions as the JSON routes, so the page and
+# the API can never disagree.
 # Run locally: uvicorn app:app --app-dir api   (in compose: the `api` service on localhost:8000)
 
 import json
 import os
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from pathlib import Path
 
 import psycopg
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
 from psycopg_pool import ConnectionPool
 from pydantic import BaseModel, ConfigDict
 
@@ -34,6 +41,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="UPI fraud API", lifespan=lifespan)
+# Relative to this file, not the working directory, so it works from the repo root and in Docker.
+# Jinja2Templates autoescapes .html files: a VPA like "<script>" is shown as text, never run (XSS).
+templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
 
 
 @app.exception_handler(psycopg.OperationalError)  # also catches PoolTimeout (a subclass)
@@ -74,7 +84,11 @@ def score(txn: Transaction):
     clean, reason = validate.validate(json.dumps(txn.model_dump()).encode())
     if clean is None:
         raise HTTPException(status_code=422, detail={"reason": reason})
+    return score_clean(clean)
 
+
+def score_clean(clean: dict) -> dict:
+    """Score an already-validated txn against the payer's history. Shared by JSON and HTML."""
     with state["pool"].connection() as conn, conn.cursor() as cur:
         history = store.fetch_history(cur, clean["payer_vpa"], clean["timestamp"],
                                       features.HISTORY_LIMIT)
@@ -89,6 +103,10 @@ def score(txn: Transaction):
 @app.get("/stats")
 def stats():
     """Pipeline counters straight from the database."""
+    return read_stats()
+
+
+def read_stats() -> dict:
     with state["pool"].connection() as conn:
         total, flagged = conn.execute(
             "SELECT count(*), count(*) FILTER (WHERE flagged) FROM transactions").fetchone()
@@ -102,6 +120,10 @@ def stats():
 @app.get("/transactions/flagged")
 def flagged_transactions(limit: int = Query(50, ge=1, le=500)):
     """Most recent flagged transactions, newest first (uses the partial index on flagged rows)."""
+    return read_flagged(limit)
+
+
+def read_flagged(limit: int) -> list[dict]:
     with state["pool"].connection() as conn:
         rows = conn.execute(
             """
@@ -114,3 +136,46 @@ def flagged_transactions(limit: int = Query(50, ge=1, le=500)):
              "timestamp": ts.isoformat(), "device_id": dev, "location": loc,
              "merchant_category": cat, "fraud_score": score}
             for t, payer, payee, amount, ts, dev, loc, cat, score in rows]
+
+
+# ---------------- HTML pages (server-side rendered, no JavaScript) ----------------
+
+FORM_FIELDS = ["txn_id", "payer_vpa", "payee_vpa", "amount", "timestamp", "device_id",
+               "location", "merchant_category"]
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard(request: Request):
+    """Stats, rejection reasons and the newest flagged txns. The page reloads itself every 5 s."""
+    return templates.TemplateResponse(request, "dashboard.html",
+                                      {"stats": read_stats(), "flagged": read_flagged(20)})
+
+
+@app.get("/ui/score", response_class=HTMLResponse)
+def score_page(request: Request):
+    """Score form. GET, not POST: scoring stores nothing, and HTML forms send GET as query params
+    with no extra library (a POST form would need python-multipart)."""
+    params = request.query_params
+    if "txn_id" not in params:  # first visit: show a valid example to edit
+        example = {"txn_id": str(uuid.uuid4()), "payer_vpa": "priya@oksbi",
+                   "payee_vpa": "grocery.store1@ybl", "amount": "450",
+                   "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                   "device_id": "dev-1", "location": "Mumbai", "merchant_category": "grocery"}
+        return templates.TemplateResponse(request, "score.html", {"form": example})
+
+    # An empty box means "missing", same as a missing JSON field, so the validator reports it.
+    form = {f: params.get(f, "").strip() for f in FORM_FIELDS}
+    record = {f: form[f] or None for f in FORM_FIELDS}
+    result, reason = None, None
+    try:
+        # Form values are always text; the validator wants a real number for amount.
+        if record["amount"] is not None:
+            record["amount"] = float(record["amount"])
+    except ValueError:
+        reason = "bad_amount"
+    if reason is None:
+        clean, reason = validate.validate(json.dumps(record).encode())
+        if clean is not None:
+            result = score_clean(clean)
+    return templates.TemplateResponse(request, "score.html",
+                                      {"form": form, "result": result, "reason": reason})

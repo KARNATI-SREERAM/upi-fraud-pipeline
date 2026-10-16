@@ -29,6 +29,7 @@ flowchart LR
     TX --> API[FastAPI<br/>:8000]
     Q --> API
     V -.-> API
+    API -->|HTML: / and /ui/score| B[browser]
 ```
 
 **One transaction, step by step**
@@ -42,6 +43,7 @@ flowchart LR
 8. **Store, idempotently.** `store.save_txn()` runs `INSERT … ON CONFLICT (txn_id) DO NOTHING`. If the id already exists, it compares the stored (partition, offset): the same offset means a Kafka **redelivery** (skip), and a different offset means a **genuine duplicate** (quarantine `duplicate_txn_id`).
 9. **Commit in the safe order.** First the DB commit, then produce to `transactions.clean` (and `transactions.flagged` if flagged) and `flush()`, and only then `consumer.commit()`. A crash before the last step means Kafka re-sends the batch, and step 8 makes that harmless.
 10. **Serve.** `GET /transactions/flagged` lists it if it was flagged, `GET /stats` counts it, and `POST /score` can score a *new* transaction for the same payer, using this one as history.
+11. **See it.** Within 5 s the dashboard at `/` reloads. Its counters include this txn, and if it was flagged it appears in the "Latest flagged" table. Both come from `read_stats()` and `read_flagged()`, the same functions behind the JSON routes.
 
 ---
 
@@ -65,7 +67,10 @@ flowchart LR
 | `model/train.py` | Simulate data, time-ordered split, train 3 models, report P/R/F1 | Class imbalance, class weights, validation vs test, no accuracy |
 | `model/scorer.py` | Load the bundle, score one txn | Model serving; fixed feature order |
 | `model/Dockerfile` | Trainer image (one-shot job) | Batch jobs inside compose |
-| `api/app.py` | `/health`, `POST /score`, `/stats`, `/transactions/flagged` | Model serving over HTTP, strict validation, connection pool, 422 vs 503 |
+| `api/app.py` | `/health`, `POST /score`, `/stats`, `/transactions/flagged`, plus HTML pages `/` and `/ui/score` | Model serving over HTTP, strict validation, connection pool, 422 vs 503; one function per query shared by JSON and HTML |
+| `api/templates/base.html` | Shared layout: nav bar and CSS | Template inheritance (`extends` / `block`) |
+| `api/templates/dashboard.html` | Stat cards, rejections by reason, newest flagged txns | Server-side rendering, meta-refresh polling |
+| `api/templates/score.html` | GET form, then score + features or the rejection reason | HTML forms, GET for read-only actions, autoescaping (XSS) |
 | `api/Dockerfile` | API image (uvicorn) | Healthcheck with the stdlib |
 | `db/schema.sql` | `transactions` + `quarantine` tables and indexes | PK as durable dedup, NUMERIC money, CHECK, partial index |
 | `benchmark/throughput.py` | Backlog of 20,000 messages → time to drain | Measuring throughput honestly (start-up included) |
@@ -80,7 +85,7 @@ flowchart LR
 | `tests/test_features.py` | Each feature, cold start, window boundary, "only earlier" | Leakage-free features |
 | `tests/test_train.py` | Metrics present, weights raise recall, deterministic | Testing ML code |
 | `tests/test_pipeline.py` | `process_batch` with fake Kafka messages + stub model | Testing a consumer without Kafka |
-| `tests/test_api.py` | Every endpoint, wrong types, DB outage → 503 | TestClient, monkeypatch |
+| `tests/test_api.py` | Every endpoint, wrong types, DB outage → 503; HTML pages render, show reasons, escape `<script>` | TestClient, monkeypatch, testing HTML output |
 
 ---
 
@@ -141,6 +146,15 @@ Seven features per transaction (`model/features.py`), all from the payer's **ear
 - In the processor, scoring happens **inside the DB transaction**, so earlier txns of the same batch count as history (`test_earlier_txns_in_the_same_batch_count_as_history`).
 - The API uses a connection pool, strict Pydantic input, the pipeline's own validation, and correct status codes (422 = bad input, 503 = DB down).
 
+### Web pages: server-side rendering (Phase 6)
+- **Server-side rendering.** The server builds the full HTML and the browser only displays it. `templates.TemplateResponse(request, "dashboard.html", {...})` fills a Jinja2 template with Python data. The alternative, a JavaScript app (React etc.) that fetches JSON, needs a second toolchain. For two read-mostly pages that would be all cost and no benefit.
+- **One source of truth.** `read_stats()`, `read_flagged()` and `score_clean()` are plain functions. The JSON routes and the HTML routes both call them, so the page can't show a different number from the API.
+- **Template inheritance.** `base.html` defines the nav and CSS once, with empty `{% block %}`s. `dashboard.html` and `score.html` `{% extends %}` it and fill the blocks.
+- **Autoescaping = XSS defence.** Every `{{ value }}` is HTML-escaped, so `<script>` becomes `&lt;script&gt;` and is shown as text. Without it, anyone who could get a string into the database (a VPA, a location) could run JavaScript in the browser of whoever opens the dashboard. `test_score_page_escapes_html` proves it.
+- **Polling without JavaScript.** `<meta http-equiv="refresh" content="5">` makes the browser reload every 5 s. Each reload runs two small queries (the flagged one uses the partial index). For true push you'd use WebSockets or Server-Sent Events, which need JavaScript.
+- **GET vs POST for the form.** GET is for reads that change nothing, and scoring stores nothing, so the form uses `method="get"` and the values arrive as query parameters (bookmarkable, safe to repeat). Changing data would require POST, and in FastAPI a POST form also needs the `python-multipart` package.
+- **Form values are text.** A browser sends `amount=450` as the string `"450"`. The page converts it with `float()` (failure → `bad_amount`), turns empty boxes into missing fields, then runs the *same* `validate.validate()` as the pipeline.
+
 ### Docker and CI
 - One command (`docker compose up --build`) builds 4 images and starts 7 services in dependency order. Healthchecks gate start-up.
 - The CI workflow runs ruff and pytest against a real Postgres service container. `REQUIRE_DB=1` makes DB tests *fail* rather than skip if the database is missing.
@@ -179,6 +193,18 @@ Seven features per transaction (`model/features.py`), all from the payer's **ear
 10. **Open a DB connection per request.** In `/score`, replace `state["pool"].connection()` with `psycopg.connect(os.environ["DATABASE_URL"])` and rerun `benchmark/api_latency.py`.
     *What goes wrong:* p50 latency goes up several-fold.
     *Why:* every request now pays for a TCP connect plus PostgreSQL authentication before doing any work. Pools exist to pay that cost once.
+
+### Bonus exercises: the web pages (Phase 6)
+
+11. **Turn off autoescaping.** In `score.html` change `{{ value }}` in the `<input>` to `{{ value|safe }}`, then open `/ui/score?location="><script>alert(1)</script>` (fill the other fields too).
+    *What goes wrong:* an alert box pops up, and `test_score_page_escapes_html` fails.
+    *Why:* `|safe` tells Jinja2 "this is trusted HTML". The quote closes the `value="..."` attribute and the script tag becomes real HTML. That's reflected XSS.
+12. **Switch the form to POST.** Change `method="get"` to `method="post"` and read the fields with `Form(...)` parameters instead of `request.query_params`.
+    *What goes wrong:* FastAPI fails with an error that `python-multipart` must be installed. After you install it, refreshing the result page makes the browser ask to "resubmit the form".
+    *Why:* form bodies need a parser that FastAPI doesn't ship with, and browsers treat POST as possibly changing data, so they won't silently repeat it.
+13. **Typo a template variable.** In `dashboard.html` change `stats.flagged` to `stats.flaged`.
+    *What goes wrong:* nothing crashes. The card is just empty.
+    *Why:* Jinja2's default "undefined" renders as an empty string. That's forgiving for pages but hides bugs. Tests have to check for real values in the HTML (as `test_dashboard_renders_stats_and_flagged_row` does for a flagged row), not just for status 200. (`jinja2.StrictUndefined` would make it raise instead.)
 
 ---
 
@@ -235,6 +261,15 @@ Seven features per transaction (`model/features.py`), all from the payer's **ear
 25. **Tell me about a bug you found.**
     The producer originally seeded its whole stream, so after a restart it re-sent identical txn_ids from the start, and the processor quarantined them all as duplicates. The fix was to seed only the user population and use fresh randomness for transactions. The measurement script restarts the producer mid-run and checks that injected dirty events equal quarantined records exactly. Others: a feature whose values kept growing over time made test recall far worse than validation (fixed by capping it), and my own benchmark once reported a recovery time that was too short because it read the offset before the kill.
 
+### Bonus questions: the web pages (Phase 6)
+
+26. **Why server-rendered templates instead of React?**
+    Two pages that mostly display data don't justify a second language, a build step and another container. FastAPI renders HTML with Jinja2 from the same functions as the JSON API, so there's one codebase and one deploy. If the UI grew (filters, live charts, many users), I'd move to a JS frontend calling the existing JSON API, which already exists for exactly that.
+27. **How is the dashboard protected against XSS?**
+    Jinja2 autoescapes every `{{ }}` in `.html` templates, so data from the database or the URL is shown as text, never parsed as HTML. A test sends `<script>` and asserts that it comes back as `&lt;script&gt;`. The pages have no authentication, though (see Limitations).
+28. **Why does the score form use GET?**
+    Scoring is read-only: it reads history and runs the model but stores nothing. GET is the correct HTTP method for safe, repeatable reads, and it avoids an extra dependency. A form that created or changed data (e.g. "mark as reviewed") would have to be POST.
+
 ---
 
 ## 6. Limitations and next steps (honest)
@@ -245,7 +280,8 @@ Seven features per transaction (`model/features.py`), all from the payer's **ear
 - **One message at a time.** Every valid txn costs one history query plus one single-row model call. That's the most likely limit on the measured 641 msg/s, but I haven't profiled it. Batch scoring and a feature store are the next steps.
 - **Mac vs Linux training differences.** Logistic regression is identical on both, but the random forest's metrics differ slightly between macOS and Linux builds of the same library versions. The documented numbers come from the Linux trainer container, which is what serves.
 - **Single broker, replication factor 1.** Fine for a laptop. Production needs 3 brokers, `min.insync.replicas=2` and monitoring.
-- **No authentication** on the API or the database beyond a local dev password. No TLS.
+- **No authentication** on the API, the dashboard or the database beyond a local dev password. No TLS.
+- **The dashboard polls.** Every open tab reloads the whole page every 5 s (two queries each). That's fine for a few viewers. Many viewers would call for caching the stats or pushing updates (Server-Sent Events/WebSockets).
 - **No schema evolution.** Changing `db/schema.sql` requires `docker compose down -v`. A real system would use migrations (e.g. Alembic).
 - **The latency benchmark** is one sequential client on the same machine, through Docker Desktop's port forwarding. It is not a load test.
 - **CI has not run on GitHub yet**: it's validated with actionlint and by running the same steps in a clean Linux container.

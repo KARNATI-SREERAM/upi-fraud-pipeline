@@ -1,6 +1,8 @@
-# Web framework + ASGI server, PostgreSQL driver with connection pool, and the ML libraries.
+# Web framework + ASGI server, PostgreSQL driver with connection pool, HTML templates (jinja2),
+# and the ML libraries.
 fastapi==0.115.6
 uvicorn==0.32.1
 psycopg[binary]==3.2.3
 psycopg-pool==3.2.4
+jinja2==3.1.4
 -r ../model/requirements.txt

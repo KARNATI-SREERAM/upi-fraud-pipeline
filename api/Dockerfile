@@ -10,5 +10,6 @@ COPY api/requirements.txt api/requirements.txt
 RUN pip install --no-cache-dir -r api/requirements.txt
 
 COPY api/app.py processor/validate.py processor/store.py model/features.py model/scorer.py ./
+COPY api/templates templates/
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

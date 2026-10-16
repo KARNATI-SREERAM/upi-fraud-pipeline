@@ -1,0 +1,37 @@
+{# Score form at GET /ui/score. Submitting sends the fields as query parameters (a GET form);
+   app.py validates them with the pipeline's own validator and scores them with score_clean(),
+   the same code behind POST /score. Nothing is stored. #}
+{% extends "base.html" %}
+{% block title %}Score a transaction{% endblock %}
+
+{% block content %}
+<h1>Score one transaction</h1>
+<p class="muted">Uses the payer's stored history from the pipeline. Try a large amount or a new
+  device for a payer who appears on the dashboard.</p>
+
+<form method="get" action="/ui/score">
+  {# One box per field, in the order app.py built the `form` dict (FORM_FIELDS order). #}
+  {% for field, value in form.items() %}
+  <label>{{ field }}<input name="{{ field }}" value="{{ value }}"></label>
+  {% endfor %}
+  <button type="submit">Score</button>
+</form>
+
+{% if reason %}
+<h2>Rejected</h2>
+<p class="error">The pipeline would quarantine this transaction. Reason: <b>{{ reason }}</b></p>
+{% elif result %}
+<h2>Result</h2>
+<p>
+  {% if result.flagged %}<span class="badge bad">FLAGGED</span>{% else %}<span class="badge ok">OK</span>{% endif %}
+  Fraud score <b>{{ "%.4f"|format(result.fraud_score) }}</b>
+  (flagged when ≥ {{ result.threshold }}, model: {{ result.model }})
+</p>
+<div class="table-wrap"><table>
+  <tr><th>Feature</th><th>Value</th></tr>
+  {% for name, value in result.features.items() %}
+  <tr><td>{{ name }}</td><td>{{ value|round(4) }}</td></tr>
+  {% endfor %}
+</table></div>
+{% endif %}
+{% endblock %}

@@ -26,6 +26,7 @@ flowchart LR
     TX --> API[FastAPI :8000]
     Q --> API
     V -.-> API
+    API -->|HTML: / and /ui/score| B[browser<br/>dashboard · score form]
 ```
 
 - **At-least-once, effectively-once storage.** Per batch: DB commit → produce to clean/flagged → commit Kafka offsets. Writes are idempotent (`txn_id` primary key; `UNIQUE(partition, offset)` on quarantine), so crashes and replays never lose or duplicate a row.
@@ -63,7 +64,7 @@ A local streaming pipeline in the payments domain, started with one command. A s
 UPI-style transactions into Kafka, including labelled fraud patterns and deliberately dirty records.
 A processor validates, cleans, deduplicates and **scores each transaction with an ML model**, then
 stores the results in PostgreSQL, quarantining bad records with a reason. A FastAPI service exposes
-health, scoring, stats and flagged transactions.
+health, scoring, stats and flagged transactions, as JSON and as a small server-rendered web dashboard.
 
 Study guide (walkthrough, concepts, exercises, interview Q&A): **[LEARNING.md](LEARNING.md)**.
 
@@ -82,6 +83,19 @@ docker compose logs trainer        # the model's precision / recall / F1 report
 docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
   --bootstrap-server localhost:9092 --topic transactions.flagged --property print.key=true
 ```
+
+## Web dashboard (http://localhost:8000/)
+
+Two HTML pages served by the same FastAPI app (Jinja2 templates in `api/templates/`, no JavaScript):
+
+| Page | What it shows |
+|---|---|
+| `/` | Live counters (stored, flagged, flag rate, rejected), rejected records by reason, the 20 newest flagged transactions. Reloads every 5 s. |
+| `/ui/score` | A form pre-filled with a valid example. Submit to see the fraud score, flagged/OK, and the 7 features behind it, or the validator's rejection reason. Nothing is stored. |
+
+The pages call the same functions as `GET /stats`, `GET /transactions/flagged` and `POST /score`,
+so the dashboard and the API always agree. Tip: copy a payer VPA, device and location from the
+database, then change only the device or the amount to watch the score move.
 
 ## API (interactive docs: http://localhost:8000/docs)
 
